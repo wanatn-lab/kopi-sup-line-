@@ -192,6 +192,19 @@ async function linePush(userId, messages, accessToken){
 }
 
 // ---------------- Flex Message (Carousel) builder ----------------
+// Unique list of supplier names known in the shared dict — used to build the
+// "ย้ายไปซัพอื่น" (move to another supplier) quick-reply choices.
+function getKnownSuppliers(dict){
+  const seen = new Set();
+  const list = [];
+  (dict || []).forEach(entry => {
+    if (entry && entry.supplier && !seen.has(entry.supplier)){
+      seen.add(entry.supplier);
+      list.push(entry.supplier);
+    }
+  });
+  return list;
+}
 function buildSupplierBubble(supplierName, items, pendingId, liffBaseUrl){
   const rows = items.map(it => ({
     type: "box", layout: "horizontal",
@@ -217,12 +230,61 @@ function buildSupplierBubble(supplierName, items, pendingId, liffBaseUrl){
         },
         {
           type: "button", style: "secondary", height: "sm",
-          action: { type: "uri", label: "✏️ แก้ไขจำนวน", uri: liffBaseUrl + "?id=" + encodeURIComponent(pendingId) + "&supplier=" + encodeURIComponent(supplierName) }
+          action: { type: "postback", label: "✏️ แก้ไข", data: "editsup:" + pendingId + ":" + encodeURIComponent(supplierName), displayText: "แก้ไข " + supplierName }
         }
       ]
     }
   };
   return bubble;
+}
+// การ์ดแก้ไขรายการก่อนส่ง: ปรับจำนวน +/- ทีละ 1 หรือย้ายรายการไปซัพพลายเออร์อื่น
+// ทั้งหมดทำผ่านปุ่มในแชท (postback) ไม่ต้องเปิดหน้าเว็บ LIFF เลย
+function buildEditItemsBubble(supplierName, items, pendingId){
+  const itemBoxes = (items || []).map((it, idx) => ({
+    type: "box", layout: "vertical", spacing: "xs", margin: idx === 0 ? "none" : "md",
+    contents: [
+      { type: "text", text: it.label, size: "sm", wrap: true, weight: "bold", color: "#1f2937" },
+      {
+        type: "box", layout: "horizontal", spacing: "sm", alignItems: "center",
+        contents: [
+          {
+            type: "button", style: "secondary", height: "sm", flex: 1,
+            action: { type: "postback", label: "➖", data: "qty:" + pendingId + ":" + encodeURIComponent(supplierName) + ":" + idx + ":-1", displayText: "ลดจำนวน " + it.label }
+          },
+          { type: "text", text: (it.qty || "?") + " " + (it.unit || ""), size: "sm", align: "center", flex: 2, color: "#111827", gravity: "center" },
+          {
+            type: "button", style: "secondary", height: "sm", flex: 1,
+            action: { type: "postback", label: "➕", data: "qty:" + pendingId + ":" + encodeURIComponent(supplierName) + ":" + idx + ":1", displayText: "เพิ่มจำนวน " + it.label }
+          },
+          {
+            type: "button", style: "secondary", height: "sm", flex: 2,
+            action: { type: "postback", label: "🔀 ย้ายซัพ", data: "movesup:" + pendingId + ":" + encodeURIComponent(supplierName) + ":" + idx, displayText: "ย้าย " + it.label + " ไปซัพอื่น" }
+          }
+        ]
+      }
+    ]
+  }));
+  return {
+    type: "bubble", size: "mega",
+    header: {
+      type: "box", layout: "vertical", backgroundColor: "#fffbeb",
+      contents: [{ type: "text", text: "✏️ แก้ไข: " + supplierName, weight: "bold", size: "md", color: "#92400e", wrap: true }]
+    },
+    body: { type: "box", layout: "vertical", spacing: "md", contents: itemBoxes.length ? itemBoxes : [{ type: "text", text: "(ไม่มีรายการ)", size: "sm", color: "#9ca3af" }] },
+    footer: {
+      type: "box", layout: "horizontal", spacing: "sm",
+      contents: [
+        {
+          type: "button", style: "primary", color: "#16a34a", height: "sm",
+          action: { type: "postback", label: "✅ ส่งเลย", data: "send:" + pendingId + ":" + encodeURIComponent(supplierName), displayText: "ส่ง " + supplierName + " เลย" }
+        },
+        {
+          type: "button", style: "secondary", height: "sm",
+          action: { type: "postback", label: "🔙 กลับ", data: "back:" + pendingId, displayText: "กลับไปหน้าสรุปออเดอร์" }
+        }
+      ]
+    }
+  };
 }
 function buildUnmatchedBubble(unmatchedItems){
   const rows = unmatchedItems.map(it => ({
@@ -312,17 +374,49 @@ export default {
       for (const event of events) {
         try {
           if (event.type === "message" && event.message && event.message.type === "text") {
+            const senderId = (event.source || {}).userId || null;
+            // เก็บ log userId ของคนพิมพ์ไว้เสมอ — ใช้หาค่า OWNER_LINE_USER_ID ตอนตั้งค่าครั้งแรก
+            // (เช็คได้จาก Cloudflare Observability logs หลังพี่ทักบอทเอง 1 ครั้ง)
+            console.log("[incoming line message]", "userId=", senderId, "text=", event.message.text);
+
             const { bySupplier, supplierOrder, unmatched } = lnParseMessageIntoSupplierGroups(event.message.text, dict, aliasTable);
             const pendingId = lnGenId("p");
             await env.KOPI_KV.put(
               "line_pending:" + pendingId,
-              JSON.stringify({ bySupplier, createdAt: Date.now(), userId: (event.source || {}).userId || null }),
+              JSON.stringify({ bySupplier, supplierOrder, unmatched, createdAt: Date.now(), userId: senderId }),
               { expirationTtl: PENDING_TTL_SECONDS }
             );
             const flexMessage = buildOrderFlexMessage(bySupplier, supplierOrder, unmatched, pendingId, liffBaseUrl);
-            await lineReply(event.replyToken, [flexMessage], env.LINE_CHANNEL_ACCESS_TOKEN);
+
+            // ถ้ายังไม่ได้ตั้ง OWNER_LINE_USER_ID ไว้ -> ถือว่าทุกคนคือเจ้าของร้าน (พฤติกรรมเดิม)
+            const isOwner = !env.OWNER_LINE_USER_ID || senderId === env.OWNER_LINE_USER_ID;
+
+            if (isOwner) {
+              // เจ้าของร้านพิมพ์เอง -> ส่งการ์ดสรุปกลับไปในแชทเดียวกันได้เลย
+              const replyRes = await lineReply(event.replyToken, [flexMessage], env.LINE_CHANNEL_ACCESS_TOKEN);
+              if (!replyRes.ok) {
+                console.error("[line reply failed]", replyRes.status, await replyRes.text());
+              }
+            } else {
+              // พนักงาน/คนอื่นพิมพ์ -> ตอบรับสั้นๆ ในแชทของเขา แล้วส่งการ์ดสรุป (push แยก)
+              // ไปหาเจ้าของร้านเพื่อตรวจ/แก้ไข/กดส่งเองในแชทของเจ้าของร้าน
+              const ackRes = await lineReply(
+                event.replyToken,
+                [{ type: "text", text: "รับออเดอร์แล้วครับ ✅ รอเจ้าของร้านตรวจสอบก่อนส่งนะครับ" }],
+                env.LINE_CHANNEL_ACCESS_TOKEN
+              );
+              if (!ackRes.ok) {
+                console.error("[line ack reply failed]", ackRes.status, await ackRes.text());
+              }
+              const pushRes = await linePush(env.OWNER_LINE_USER_ID, [flexMessage], env.LINE_CHANNEL_ACCESS_TOKEN);
+              if (!pushRes.ok) {
+                console.error("[line push to owner failed]", pushRes.status, await pushRes.text());
+              }
+            }
+
           } else if (event.type === "postback") {
             const data = event.postback && event.postback.data || "";
+
             if (data.startsWith("send:")) {
               const rest = data.slice("send:".length);
               const sepIdx = rest.indexOf(":");
@@ -333,11 +427,111 @@ export default {
               const text = items.length
                 ? formatSupplierPlainText(supplierName, items)
                 : "ไม่พบรายการสำหรับ " + supplierName + " (อาจหมดอายุหรือถูกแก้ไขไปแล้ว)";
-              await lineReply(event.replyToken, [{ type: "text", text }], env.LINE_CHANNEL_ACCESS_TOKEN);
+              const pbRes = await lineReply(event.replyToken, [{ type: "text", text }], env.LINE_CHANNEL_ACCESS_TOKEN);
+              if (!pbRes.ok) {
+                console.error("[line postback reply failed]", pbRes.status, await pbRes.text());
+              }
+
+            } else if (data.startsWith("editsup:")) {
+              // เปิดการ์ดแก้ไขจำนวน/ย้ายซัพของซัพพลายเออร์นี้ (ในแชทเลย ไม่ต้องเปิดหน้าเว็บ)
+              const rest = data.slice("editsup:".length);
+              const sepIdx = rest.indexOf(":");
+              const pendingId = rest.slice(0, sepIdx);
+              const supplierName = decodeURIComponent(rest.slice(sepIdx + 1));
+              const record = await env.KOPI_KV.get("line_pending:" + pendingId, { type: "json" });
+              const items = record && record.bySupplier ? (record.bySupplier[supplierName] || []) : [];
+              const editBubble = buildEditItemsBubble(supplierName, items, pendingId);
+              const res = await lineReply(
+                event.replyToken,
+                [{ type: "flex", altText: "แก้ไขรายการ " + supplierName, contents: editBubble }],
+                env.LINE_CHANNEL_ACCESS_TOKEN
+              );
+              if (!res.ok) console.error("[line editsup reply failed]", res.status, await res.text());
+
+            } else if (data.startsWith("qty:")) {
+              // ปรับจำนวนสินค้าทีละ 1 หน่วย (+1 / -1) แล้วส่งการ์ดแก้ไขเวอร์ชันล่าสุดกลับไป
+              const parts = data.slice("qty:".length).split(":");
+              const pendingId = parts[0];
+              const supplierName = decodeURIComponent(parts[1]);
+              const itemIdx = parseInt(parts[2], 10);
+              const delta = parseFloat(parts[3]);
+              const record = await env.KOPI_KV.get("line_pending:" + pendingId, { type: "json" });
+              if (record && record.bySupplier && record.bySupplier[supplierName] && record.bySupplier[supplierName][itemIdx]) {
+                const item = record.bySupplier[supplierName][itemIdx];
+                const current = parseFloat(item.qty) || 0;
+                const next = Math.max(0, current + delta);
+                item.qty = (Number.isInteger(next) ? next : Math.round(next * 100) / 100).toString();
+                await env.KOPI_KV.put("line_pending:" + pendingId, JSON.stringify(record), { expirationTtl: PENDING_TTL_SECONDS });
+              }
+              const items = record && record.bySupplier ? (record.bySupplier[supplierName] || []) : [];
+              const editBubble = buildEditItemsBubble(supplierName, items, pendingId);
+              const res = await lineReply(
+                event.replyToken,
+                [{ type: "flex", altText: "แก้ไขรายการ " + supplierName, contents: editBubble }],
+                env.LINE_CHANNEL_ACCESS_TOKEN
+              );
+              if (!res.ok) console.error("[line qty reply failed]", res.status, await res.text());
+
+            } else if (data.startsWith("movesup:")) {
+              // ถามว่าจะย้ายรายการนี้ไปซัพพลายเออร์ไหน (แสดงเป็นปุ่ม quick reply)
+              const parts = data.slice("movesup:".length).split(":");
+              const pendingId = parts[0];
+              const supplierName = decodeURIComponent(parts[1]);
+              const itemIdx = parts[2];
+              const knownSuppliers = getKnownSuppliers(dict).filter(s => s !== supplierName).slice(0, 12);
+              const quickItems = knownSuppliers.map(s => ({
+                type: "action",
+                action: {
+                  type: "postback",
+                  label: s.slice(0, 20),
+                  data: "moveto:" + pendingId + ":" + encodeURIComponent(supplierName) + ":" + itemIdx + ":" + encodeURIComponent(s),
+                  displayText: "ย้ายไป " + s
+                }
+              }));
+              const res = await lineReply(
+                event.replyToken,
+                [{ type: "text", text: "ย้ายรายการนี้ไปซัพพลายเออร์ไหนครับ?", quickReply: { items: quickItems } }],
+                env.LINE_CHANNEL_ACCESS_TOKEN
+              );
+              if (!res.ok) console.error("[line movesup reply failed]", res.status, await res.text());
+
+            } else if (data.startsWith("moveto:")) {
+              // ย้ายรายการจากซัพพลายเออร์เดิมไปซัพพลายเออร์ใหม่ แล้วแสดงหน้าสรุปที่อัปเดตแล้ว
+              const parts = data.slice("moveto:".length).split(":");
+              const pendingId = parts[0];
+              const srcSupplier = decodeURIComponent(parts[1]);
+              const itemIdx = parseInt(parts[2], 10);
+              const destSupplier = decodeURIComponent(parts[3]);
+              const record = await env.KOPI_KV.get("line_pending:" + pendingId, { type: "json" });
+              if (record && record.bySupplier && record.bySupplier[srcSupplier] && record.bySupplier[srcSupplier][itemIdx]) {
+                const moved = record.bySupplier[srcSupplier].splice(itemIdx, 1)[0];
+                if (!record.bySupplier[destSupplier]) record.bySupplier[destSupplier] = [];
+                record.bySupplier[destSupplier].push(moved);
+                if (!Array.isArray(record.supplierOrder)) record.supplierOrder = Object.keys(record.bySupplier);
+                if (!record.supplierOrder.includes(destSupplier)) record.supplierOrder.push(destSupplier);
+                await env.KOPI_KV.put("line_pending:" + pendingId, JSON.stringify(record), { expirationTtl: PENDING_TTL_SECONDS });
+              }
+              const updated = await env.KOPI_KV.get("line_pending:" + pendingId, { type: "json" });
+              const flexMessage = updated
+                ? buildOrderFlexMessage(updated.bySupplier, updated.supplierOrder || Object.keys(updated.bySupplier), updated.unmatched || [], pendingId, liffBaseUrl)
+                : { type: "text", text: "ไม่พบออเดอร์นี้แล้ว (อาจหมดอายุ)" };
+              const res = await lineReply(event.replyToken, [flexMessage], env.LINE_CHANNEL_ACCESS_TOKEN);
+              if (!res.ok) console.error("[line moveto reply failed]", res.status, await res.text());
+
+            } else if (data.startsWith("back:")) {
+              // กลับไปหน้าสรุปออเดอร์ทั้งหมด (การ์ดรวมทุกซัพพลายเออร์)
+              const pendingId = data.slice("back:".length);
+              const record = await env.KOPI_KV.get("line_pending:" + pendingId, { type: "json" });
+              const flexMessage = record
+                ? buildOrderFlexMessage(record.bySupplier, record.supplierOrder || Object.keys(record.bySupplier), record.unmatched || [], pendingId, liffBaseUrl)
+                : { type: "text", text: "ไม่พบออเดอร์นี้แล้ว (อาจหมดอายุ)" };
+              const res = await lineReply(event.replyToken, [flexMessage], env.LINE_CHANNEL_ACCESS_TOKEN);
+              if (!res.ok) console.error("[line back reply failed]", res.status, await res.text());
             }
           }
         } catch (e) {
           // One bad event shouldn't 500 the whole webhook batch — LINE retries on non-200.
+          console.error("[webhook event error]", (e && e.stack) || e);
         }
       }
       return new Response("OK", { status: 200 });
