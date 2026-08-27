@@ -1,0 +1,15 @@
+name = "supplier-order"
+main = "worker.js"
+compatibility_date = "2026-08-10"
+account_id = "1de22e9a000512b62ee092d650d6cf3c"
+preview_urls = false
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+
+[[kv_namespaces]]
+binding = "KOPI_KV"
+id = "37034d6b08ec4099a6ed50ba5dddd236"
