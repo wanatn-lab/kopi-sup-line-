@@ -742,25 +742,28 @@ export default {
             // Every order card goes only to the admin's 1:1 chat with the bot.
             // Staff (and people in a shared group) receive an acknowledgement only,
             // so they cannot see or operate supplier-send/edit controls.
-            const sourceText = isAdminLineUser(env, senderId, activeAdminId)
+            const senderIsAdmin = isAdminLineUser(env, senderId, activeAdminId);
+            const sourceText = senderIsAdmin
               ? "📩 รายการใหม่จากแอดมิน"
               : "📩 รายการใหม่จากพนักงาน — รอตรวจสอบก่อนส่งซัพพลายเออร์";
-            const pushRes = await linePush(
-              activeAdminId,
-              [{ type: "text", text: sourceText }, flexMessage],
-              env.LINE_CHANNEL_ACCESS_TOKEN
-            );
+            // Reply and push concurrently. This makes the staff confirmation visible
+            // immediately even when a Flex card takes longer to reach the admin.
+            const [ackRes, pushRes] = await Promise.all([
+              lineReply(
+                event.replyToken,
+                [{ type: "text", text: "รับรายการแล้วครับ ✅ กำลังส่งให้แอดมินตรวจสอบ" }],
+                env.LINE_CHANNEL_ACCESS_TOKEN
+              ),
+              linePush(
+                activeAdminId,
+                [{ type: "text", text: sourceText }, flexMessage],
+                env.LINE_CHANNEL_ACCESS_TOKEN
+              )
+            ]);
+            console.log("[line order routing]", "fromAdmin=", senderIsAdmin, "pushStatus=", pushRes.status, "ackStatus=", ackRes.status);
             if (!pushRes.ok) {
               console.error("[line push to admin failed]", pushRes.status, await pushRes.text());
             }
-            const acknowledgement = pushRes.ok
-              ? "รับรายการแล้วครับ ✅ ส่งให้แอดมินตรวจสอบก่อนส่งซัพพลายเออร์"
-              : "รับรายการแล้ว แต่ยังส่งให้แอดมินไม่สำเร็จ — ให้แอดมินเพิ่มบอตเป็นเพื่อนและเปิดแชตกับบอตก่อน";
-            const ackRes = await lineReply(
-              event.replyToken,
-              [{ type: "text", text: acknowledgement }],
-              env.LINE_CHANNEL_ACCESS_TOKEN
-            );
             if (!ackRes.ok) {
               console.error("[line order acknowledgement failed]", ackRes.status, await ackRes.text());
             }
