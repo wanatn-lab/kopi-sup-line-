@@ -463,6 +463,14 @@ function normalizeEditedQuantity(value){
   return Number.isInteger(amount) ? String(amount) : String(Math.round(amount * 100) / 100);
 }
 
+function normalizeEditedUnit(value, fallback){
+  if (value === undefined) return String(fallback || "").trim();
+  if (typeof value !== "string") return null;
+  const unit = value.trim().replace(/\s+/g, " ");
+  if (unit.length > 30 || /[\r\n]/.test(unit)) return null;
+  return unit;
+}
+
 function ensureUnmatchedItemIds(record){
   if (!Array.isArray(record.unmatched)) record.unmatched = [];
   record.unmatched = record.unmatched.map((item) => Object.assign({}, item, { id: item.id || lnGenId("u") }));
@@ -480,13 +488,15 @@ const LIFF_PAGE = "<!DOCTYPE html>\n<html lang=\"th\">\n<head>\n<meta charset=\"
 const LIFF_ENHANCEMENTS = String.raw`<script>
 (() => {
   const style = document.createElement("style");
-  style.textContent = ".item-row{flex-wrap:wrap}.item-row .supplier-select{width:100%;padding:7px 8px;border:1px solid #e5e7eb;border-radius:8px;background:#fff;font-size:13px}.item-row .remove-item{border:1px solid #fecaca;background:#fff;color:#dc2626;border-radius:8px;width:32px;height:32px;font-size:20px;line-height:1;cursor:pointer}";
+  style.textContent = ".item-row{flex-wrap:wrap}.item-row .supplier-select,.item-row .unit-select{padding:7px 8px;border:1px solid #e5e7eb;border-radius:8px;background:#fff;font-size:13px}.item-row .supplier-select{width:100%}.item-row .unit-select{min-width:72px;max-width:112px}.item-row .remove-item{border:1px solid #fecaca;background:#fff;color:#dc2626;border-radius:8px;width:32px;height:32px;font-size:20px;line-height:1;cursor:pointer}";
   document.head.appendChild(style);
   const qs = (selector) => document.querySelector(selector);
   const escapeHtml = (value) => (value || "").toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
   let token = "";
   let items = [];
   let suppliers = [];
+  const standardUnits = ["", "ขีด", "โล", "กก.", "กิโลกรัม", "กรัม", "หัว", "ชิ้น", "ถุง", "ห่อ", "กล่อง", "ขวด", "แพ็ค", "แผง", "ใบ", "มัด", "ลัง", "ฟอง", "ลิตร", "มล."];
+  let addedUnits = [];
   const unmatchedMode = new URLSearchParams(location.search).get("unmatched") === "1";
   const authHeaders = (extra) => Object.assign({ "X-LIFF-ID-TOKEN": token }, extra || {});
 
@@ -502,6 +512,15 @@ const LIFF_ENHANCEMENTS = String.raw`<script>
       const index = Number(select.dataset.supplierIdx);
       if (items[index]) items[index].supplier = select.value;
     });
+    document.querySelectorAll(".unit-select").forEach((select) => {
+      const index = Number(select.dataset.unitIdx);
+      if (items[index] && select.value !== "__custom_unit__") items[index].unit = select.value;
+    });
+  }
+
+  function unitOptions(selectedUnit) {
+    const units = Array.from(new Set(standardUnits.concat(addedUnits, items.map((item) => item.unit || ""))));
+    return units.map((unit) => '<option value="' + escapeHtml(unit) + '"' + (unit === (selectedUnit || "") ? " selected" : "") + '>' + escapeHtml(unit || "— ไม่ระบุหน่วย —") + '</option>').join("") + '<option value="__custom_unit__">＋ เพิ่มหน่วย…</option>';
   }
 
   function render() {
@@ -516,8 +535,26 @@ const LIFF_ENHANCEMENTS = String.raw`<script>
       const row = document.createElement("div");
       row.className = "item-row";
       const supplierOptions = (unmatchedMode ? '<option value="">เลือกซัพพลายเออร์</option>' : '') + suppliers.map((name) => '<option value="' + escapeHtml(name) + '"' + (name === item.supplier ? ' selected' : '') + '>' + escapeHtml(name) + '</option>').join("");
-      row.innerHTML = '<span class="name">' + escapeHtml(item.label) + '</span><input type="text" inputmode="decimal" aria-label="จำนวน ' + escapeHtml(item.label) + '" value="' + escapeHtml(item.qty) + '" data-idx="' + index + '"><span class="unit">' + escapeHtml(item.unit) + '</span><button type="button" class="remove-item" data-remove="' + index + '" aria-label="ยกเลิกรายการ ' + escapeHtml(item.label) + '">×</button><select class="supplier-select" aria-label="ย้าย ' + escapeHtml(item.label) + ' ไปยังซัพพลายเออร์" data-supplier-idx="' + index + '">' + supplierOptions + '</select>';
+      row.innerHTML = '<span class="name">' + escapeHtml(item.label) + '</span><input type="text" inputmode="decimal" aria-label="จำนวน ' + escapeHtml(item.label) + '" value="' + escapeHtml(item.qty) + '" data-idx="' + index + '"><select class="unit-select" aria-label="หน่วยของ ' + escapeHtml(item.label) + '" data-unit-idx="' + index + '">' + unitOptions(item.unit) + '</select><button type="button" class="remove-item" data-remove="' + index + '" aria-label="ยกเลิกรายการ ' + escapeHtml(item.label) + '">×</button><select class="supplier-select" aria-label="ย้าย ' + escapeHtml(item.label) + ' ไปยังซัพพลายเออร์" data-supplier-idx="' + index + '">' + supplierOptions + '</select>';
       body.appendChild(row);
+    });
+    body.querySelectorAll(".unit-select").forEach((select) => {
+      select.addEventListener("change", () => {
+        const index = Number(select.dataset.unitIdx);
+        if (select.value !== "__custom_unit__") {
+          if (items[index]) items[index].unit = select.value;
+          return;
+        }
+        captureEditsFromForm();
+        const unit = (window.prompt("เพิ่มหน่วยใหม่ เช่น กระสอบ, ลัง, แท่ง") || "").trim();
+        if (unit) {
+          if (!addedUnits.includes(unit)) addedUnits.push(unit);
+          if (items[index]) items[index].unit = unit;
+          render();
+        } else if (items[index]) {
+          select.value = items[index].unit || "";
+        }
+      });
     });
     body.querySelectorAll("[data-remove]").forEach((button) => {
       button.addEventListener("click", () => {
@@ -539,7 +576,7 @@ const LIFF_ENHANCEMENTS = String.raw`<script>
     suppliers = Array.from(new Set([data.supplier].concat(data.suppliers || []).filter(Boolean)));
     items = (data.items || []).map((item) => Object.assign({}, item, { supplier: unmatchedMode ? "" : (data.supplier || supplierName) }));
     qs("#titleEl").textContent = unmatchedMode ? "จัดกลุ่มรายการที่ยังไม่แมท" : "แก้ไขออเดอร์ — " + (data.supplier || supplierName);
-    qs("#subEl").textContent = unmatchedMode ? items.length + " รายการ · เลือกซัพ ปรับจำนวน หรือลบ" : items.length + " รายการ · พิมพ์จำนวน เลือกย้ายซัพ หรือกด × เพื่อลบ";
+    qs("#subEl").textContent = unmatchedMode ? items.length + " รายการ · เลือกซัพ จำนวน หน่วย หรือลบ" : items.length + " รายการ · ปรับจำนวน/หน่วย ย้ายซัพ หรือกด × เพื่อลบ";
     render();
   }
 
@@ -556,7 +593,7 @@ const LIFF_ENHANCEMENTS = String.raw`<script>
       const response = await fetch("/api/pending-order", {
         method: "POST",
         headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ id: pendingId, supplier: supplierName, unmatched: unmatchedMode, items: items.map((item) => ({ id: item.id, qty: item.qty, supplier: item.supplier })) })
+        body: JSON.stringify({ id: pendingId, supplier: supplierName, unmatched: unmatchedMode, items: items.map((item) => ({ id: item.id, qty: item.qty, unit: item.unit, supplier: item.supplier })) })
       });
       if (!response.ok) throw new Error(await response.text());
       qs("#bodyEl").innerHTML = '<div class="msg">✅ บันทึกแล้ว ' + (unmatchedMode ? 'กลับไปกด “สรุปใหม่” ในแชท แล้วกด “ส่งเลย” ได้ทันที' : 'กลับไปกด “ส่งเลย” ในแชทได้ทันที') + '</div>';
@@ -898,12 +935,13 @@ export default {
             if (!patch || typeof patch.id !== "string" || seenIds.has(patch.id)) return new Response("Bad request", { status: 400 });
             const existing = existingById.get(patch.id);
             const qty = normalizeEditedQuantity(patch.qty);
+            const unit = normalizeEditedUnit(patch.unit, existing && existing.unit);
             const targetSupplier = typeof patch.supplier === "string" ? patch.supplier : "";
-            if (!existing || qty === null || !allowedSuppliers.has(targetSupplier)) return new Response("Invalid item, quantity, or supplier", { status: 400 });
+            if (!existing || qty === null || unit === null || !allowedSuppliers.has(targetSupplier)) return new Response("Invalid item, quantity, unit, or supplier", { status: 400 });
             seenIds.add(patch.id);
             if (qty !== "0") {
               if (!record.bySupplier[targetSupplier]) record.bySupplier[targetSupplier] = [];
-              record.bySupplier[targetSupplier].push({ id: existing.id, label: existing.label, qty, unit: existing.unit, department: existing.department || null });
+              record.bySupplier[targetSupplier].push({ id: existing.id, label: existing.label, qty, unit, department: existing.department || null });
               if (!addedSuppliers.includes(targetSupplier)) addedSuppliers.push(targetSupplier);
             }
           }
@@ -929,13 +967,14 @@ export default {
           }
           const existing = existingById.get(patch.id);
           const qty = normalizeEditedQuantity(patch.qty);
-          if (!existing || qty === null) return new Response("Invalid item or quantity", { status: 400 });
+          const unit = normalizeEditedUnit(patch.unit, existing && existing.unit);
+          if (!existing || qty === null || unit === null) return new Response("Invalid item, quantity, or unit", { status: 400 });
           const targetSupplier = typeof patch.supplier === "string" && patch.supplier ? patch.supplier : supplier;
           if (!allowedSuppliers.has(targetSupplier)) return new Response("Invalid supplier", { status: 400 });
           seenIds.add(patch.id);
           if (qty !== "0") {
             if (!nextBySupplier[targetSupplier]) nextBySupplier[targetSupplier] = [];
-            nextBySupplier[targetSupplier].push(Object.assign({}, existing, { qty }));
+            nextBySupplier[targetSupplier].push(Object.assign({}, existing, { qty, unit }));
             if (!addedSuppliers.includes(targetSupplier)) addedSuppliers.push(targetSupplier);
           }
         }
