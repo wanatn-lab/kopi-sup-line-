@@ -726,7 +726,20 @@ export default {
               continue;
             }
 
+            // Confirm receipt before parsing or saving the order. A malformed item
+            // must never leave the staff member wondering whether LINE received it.
+            const ackRes = await lineReply(
+              event.replyToken,
+              [{ type: "text", text: "รับรายการแล้วครับ ✅ กำลังส่งให้แอดมินตรวจสอบ" }],
+              env.LINE_CHANNEL_ACCESS_TOKEN
+            );
+            console.log("[line order acknowledgement]", "status=", ackRes.status);
+            if (!ackRes.ok) {
+              console.error("[line order acknowledgement failed]", ackRes.status, await ackRes.text());
+            }
+
             const { bySupplier, supplierOrder, unmatched } = lnParseMessageIntoSupplierGroups(event.message.text, dict, aliasTable);
+            console.log("[line order parsed]", "suppliers=", supplierOrder.length, "unmatched=", unmatched.length);
             const metadata = { userId: senderId, submittedByAdmin: isAdminLineUser(env, senderId, activeAdminId) };
             const draftBubbles = [];
             for (const supplierName of supplierOrder) {
@@ -746,26 +759,14 @@ export default {
             const sourceText = senderIsAdmin
               ? "📩 รายการใหม่จากแอดมิน"
               : "📩 รายการใหม่จากพนักงาน — รอตรวจสอบก่อนส่งซัพพลายเออร์";
-            // Reply and push concurrently. This makes the staff confirmation visible
-            // immediately even when a Flex card takes longer to reach the admin.
-            const [ackRes, pushRes] = await Promise.all([
-              lineReply(
-                event.replyToken,
-                [{ type: "text", text: "รับรายการแล้วครับ ✅ กำลังส่งให้แอดมินตรวจสอบ" }],
-                env.LINE_CHANNEL_ACCESS_TOKEN
-              ),
-              linePush(
-                activeAdminId,
-                [{ type: "text", text: sourceText }, flexMessage],
-                env.LINE_CHANNEL_ACCESS_TOKEN
-              )
-            ]);
+            const pushRes = await linePush(
+              activeAdminId,
+              [{ type: "text", text: sourceText }, flexMessage],
+              env.LINE_CHANNEL_ACCESS_TOKEN
+            );
             console.log("[line order routing]", "fromAdmin=", senderIsAdmin, "pushStatus=", pushRes.status, "ackStatus=", ackRes.status);
             if (!pushRes.ok) {
               console.error("[line push to admin failed]", pushRes.status, await pushRes.text());
-            }
-            if (!ackRes.ok) {
-              console.error("[line order acknowledgement failed]", ackRes.status, await ackRes.text());
             }
 
           } else if (event.type === "postback") {
