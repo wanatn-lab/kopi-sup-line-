@@ -744,17 +744,35 @@ export default {
             const { bySupplier, supplierOrder, unmatched } = lnParseMessageIntoSupplierGroups(event.message.text, dict, aliasTable);
             console.log("[line order parsed]", "suppliers=", supplierOrder.length, "unmatched=", unmatched.length);
             const metadata = { userId: senderId, submittedByAdmin: isAdminLineUser(env, senderId, activeAdminId) };
-            const draftBubbles = [];
-            for (const supplierName of supplierOrder) {
-              console.log("[line draft upsert]", "supplier=", supplierName);
-              const draft = await upsertSupplierDraft(env.KOPI_KV, activeAdminId, supplierName, bySupplier[supplierName], metadata);
-              draftBubbles.push(buildSupplierBubble(supplierName, draft.record.bySupplier[supplierName], draft.pendingId, liffBaseUrl));
+            let flexMessage;
+            try {
+              const draftBubbles = [];
+              for (const supplierName of supplierOrder) {
+                const draft = await upsertSupplierDraft(env.KOPI_KV, activeAdminId, supplierName, bySupplier[supplierName], metadata);
+                draftBubbles.push(buildSupplierBubble(supplierName, draft.record.bySupplier[supplierName], draft.pendingId, liffBaseUrl));
+              }
+              if (unmatched.length) {
+                const unmatchedDraft = await upsertUnmatchedDraft(env.KOPI_KV, activeAdminId, unmatched, metadata);
+                draftBubbles.push(buildUnmatchedBubble(unmatchedDraft.record.unmatched, unmatchedDraft.pendingId, liffBaseUrl));
+              }
+              flexMessage = buildAdminDraftFlexMessage(draftBubbles);
+            } catch (draftError) {
+              // Never discard a staff order because an older open-draft record is
+              // unavailable. Preserve the complete message as a fresh card instead.
+              console.log("[line draft recovery]", (draftError && (draftError.message || draftError.stack)) || String(draftError));
+              const fallbackPendingId = lnGenId("p");
+              const fallbackRecord = {
+                bySupplier,
+                supplierOrder,
+                unmatched,
+                createdAt: Date.now(),
+                userId: senderId,
+                submittedByAdmin: metadata.submittedByAdmin,
+                sentSuppliers: {}
+              };
+              await env.KOPI_KV.put("line_pending:" + fallbackPendingId, JSON.stringify(fallbackRecord), { expirationTtl: PENDING_TTL_SECONDS });
+              flexMessage = buildOrderFlexMessage(bySupplier, supplierOrder, unmatched, fallbackPendingId, liffBaseUrl);
             }
-            if (unmatched.length) {
-              const unmatchedDraft = await upsertUnmatchedDraft(env.KOPI_KV, activeAdminId, unmatched, metadata);
-              draftBubbles.push(buildUnmatchedBubble(unmatchedDraft.record.unmatched, unmatchedDraft.pendingId, liffBaseUrl));
-            }
-            const flexMessage = buildAdminDraftFlexMessage(draftBubbles);
 
             // Every order card goes only to the admin's 1:1 chat with the bot.
             // Staff (and people in a shared group) receive an acknowledgement only,
