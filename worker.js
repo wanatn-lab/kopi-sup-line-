@@ -678,13 +678,33 @@ export default {
             // (เช็คได้จาก Cloudflare Observability logs หลังพี่ทักบอทเอง 1 ครั้ง)
             console.log("[incoming line message]", "userId=", senderId, "text=", event.message.text);
 
-            const setupMatch = event.message.text.trim().match(/^#ตั้งแอดมิน\s+(.+)$/);
+            // LINE can insert zero-width characters when text is copied. Normalize
+            // the pairing command so it is never mistaken for a purchase order.
+            const setupText = event.message.text
+              .normalize("NFKC")
+              .replace(/[\u200B-\u200D\uFEFF]/g, "")
+              .trim();
+            const setupMatch = setupText.match(/^#\s*ตั้งแอดมิน\s+(.+?)\s*$/);
             const pairedAdminId = await env.KOPI_KV.get(ACTIVE_ADMIN_KEY);
-            if (setupMatch && senderId && !pairedAdminId && env.ADMIN_SETUP_CODE && setupMatch[1] === env.ADMIN_SETUP_CODE) {
-              await env.KOPI_KV.put(ACTIVE_ADMIN_KEY, senderId);
+            if (setupMatch) {
+              const providedCode = setupMatch[1].normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+              const expectedCode = String(env.ADMIN_SETUP_CODE || "").normalize("NFKC").trim();
+              let setupReplyText;
+              if (!senderId) {
+                setupReplyText = "ตั้งค่าแอดมินได้เฉพาะในแชตส่วนตัวกับบอตครับ";
+              } else if (pairedAdminId) {
+                setupReplyText = "ระบบมีแอดมินที่จับคู่แล้ว จึงไม่เปลี่ยนเครื่องอัตโนมัติครับ";
+              } else if (!expectedCode) {
+                setupReplyText = "ระบบยังไม่ได้ตั้งรหัสจับคู่แอดมินครับ";
+              } else if (providedCode !== expectedCode) {
+                setupReplyText = "รหัสจับคู่ไม่ถูกต้อง กรุณาคัดลอกคำสั่งจากแอดมินระบบอีกครั้งครับ";
+              } else {
+                await env.KOPI_KV.put(ACTIVE_ADMIN_KEY, senderId);
+                setupReplyText = "ตั้งค่าเครื่องนี้เป็นแอดมินแล้ว ✅ รายการใหม่จะถูกส่งมาที่แชตนี้";
+              }
               const pairedReply = await lineReply(
                 event.replyToken,
-                [{ type: "text", text: "ตั้งค่าเครื่องนี้เป็นแอดมินแล้ว ✅ รายการใหม่จะถูกส่งมาที่แชตนี้" }],
+                [{ type: "text", text: setupReplyText }],
                 env.LINE_CHANNEL_ACCESS_TOKEN
               );
               if (!pairedReply.ok) console.error("[line admin pairing reply failed]", pairedReply.status, await pairedReply.text());
