@@ -342,6 +342,84 @@ function buildOrderFlexMessage(bySupplier, supplierOrder, unmatched, pendingId, 
     contents: { type: "carousel", contents: bubbles }
   };
 }
+
+function buildAdminDraftFlexMessage(bubbles){
+  if (!bubbles.length) return { type: "text", text: "ไม่พบรายการที่ส่งต่อให้แอดมิน" };
+  return {
+    type: "flex",
+    altText: "มีรายการรอตรวจสอบ " + bubbles.length + " หมวด",
+    contents: { type: "carousel", contents: bubbles.slice(0, 12) }
+  };
+}
+
+function draftKey(adminId, name){
+  return "line_open_draft:" + encodeURIComponent(adminId) + ":" + encodeURIComponent(name);
+}
+
+function mergeDraftItems(existingItems, incomingItems){
+  const merged = Array.isArray(existingItems) ? existingItems.slice() : [];
+  (incomingItems || []).forEach((incoming) => {
+    const found = merged.find((item) => item.label === incoming.label && item.unit === incoming.unit && item.department === incoming.department);
+    if (found && found.qty !== "?" && incoming.qty !== "?") {
+      found.qty = String(Math.round(((Number(found.qty) || 0) + (Number(incoming.qty) || 0)) * 100) / 100);
+    } else {
+      merged.push(incoming);
+    }
+  });
+  return merged;
+}
+
+async function upsertSupplierDraft(kv, adminId, supplier, items, metadata){
+  const key = draftKey(adminId, supplier);
+  const existingId = await kv.get(key);
+  let pendingId = existingId || lnGenId("p");
+  let record = existingId ? await kv.get("line_pending:" + existingId, { type: "json" }) : null;
+  if (!record || record.sentSuppliers && record.sentSuppliers[supplier]) {
+    pendingId = lnGenId("p");
+    record = { bySupplier: {}, supplierOrder: [supplier], unmatched: [], createdAt: Date.now(), userId: metadata.userId, submittedByAdmin: metadata.submittedByAdmin, sentSuppliers: {} };
+  }
+  record.bySupplier = record.bySupplier || {};
+  record.bySupplier[supplier] = mergeDraftItems(record.bySupplier[supplier], items);
+  if (!Array.isArray(record.supplierOrder)) record.supplierOrder = [supplier];
+  if (!record.supplierOrder.includes(supplier)) record.supplierOrder.push(supplier);
+  record.updatedAt = Date.now();
+  await kv.put("line_pending:" + pendingId, JSON.stringify(record), { expirationTtl: PENDING_TTL_SECONDS });
+  await kv.put(key, pendingId, { expirationTtl: PENDING_TTL_SECONDS });
+  return { pendingId, record };
+}
+
+async function upsertUnmatchedDraft(kv, adminId, items, metadata){
+  const key = draftKey(adminId, "__unmatched__");
+  const existingId = await kv.get(key);
+  let pendingId = existingId || lnGenId("p");
+  let record = existingId ? await kv.get("line_pending:" + existingId, { type: "json" }) : null;
+  if (!record) {
+    record = { bySupplier: {}, supplierOrder: [], unmatched: [], createdAt: Date.now(), userId: metadata.userId, submittedByAdmin: metadata.submittedByAdmin, sentSuppliers: {} };
+  }
+  record.unmatched = mergeDraftItems(record.unmatched, items);
+  record.updatedAt = Date.now();
+  await kv.put("line_pending:" + pendingId, JSON.stringify(record), { expirationTtl: PENDING_TTL_SECONDS });
+  await kv.put(key, pendingId, { expirationTtl: PENDING_TTL_SECONDS });
+  return { pendingId, record };
+}
+
+async function pushLatestDraftCard(env, adminUserId, pendingId, record, notice){
+  if (!env.LINE_CHANNEL_ACCESS_TOKEN || !adminUserId || !record) return;
+  const liffBaseUrl = env.LIFF_ID ? (env.LIFF_BASE_URL || ("https://liff.line.me/" + env.LIFF_ID)) : "";
+  const supplierOrder = (record.supplierOrder || Object.keys(record.bySupplier || {}))
+    .filter((supplier) => Array.isArray(record.bySupplier && record.bySupplier[supplier]) && record.bySupplier[supplier].length);
+  const summary = buildOrderFlexMessage(record.bySupplier || {}, supplierOrder, record.unmatched || [], pendingId, liffBaseUrl);
+  const cardMessage = summary.type === "flex"
+    ? summary
+    : { type: "text", text: summary.text || "ออเดอร์นี้ไม่มีรายการเหลือแล้ว" };
+  const response = await linePush(
+    adminUserId,
+    [{ type: "text", text: "✏️ อัปเดตล่าสุด: " + notice }, cardMessage],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+  if (!response.ok) console.error("[line latest-draft push failed]", response.status, await response.text());
+}
+
 function formatSupplierPlainText(supplierName, items){
   const date = new Date().toLocaleDateString("th-TH", { year: "numeric", month: "long", day: "numeric" });
   let text = "รายการสั่งของวันที่ " + date + "\n- ซัพพลายเออร์ " + supplierName + ":\n";
@@ -412,6 +490,20 @@ const LIFF_ENHANCEMENTS = String.raw`<script>
   const unmatchedMode = new URLSearchParams(location.search).get("unmatched") === "1";
   const authHeaders = (extra) => Object.assign({ "X-LIFF-ID-TOKEN": token }, extra || {});
 
+  // Rendering the rows recreates their inputs.  Keep every value currently typed
+  // in the DOM before removing one row, otherwise an unrelated quantity reverts
+  // to the value that was originally loaded from the server.
+  function captureEditsFromForm() {
+    document.querySelectorAll(".item-row input").forEach((input) => {
+      const index = Number(input.dataset.idx);
+      if (items[index]) items[index].qty = input.value.trim();
+    });
+    document.querySelectorAll(".supplier-select").forEach((select) => {
+      const index = Number(select.dataset.supplierIdx);
+      if (items[index]) items[index].supplier = select.value;
+    });
+  }
+
   function render() {
     const body = qs("#bodyEl");
     body.innerHTML = "";
@@ -430,7 +522,8 @@ const LIFF_ENHANCEMENTS = String.raw`<script>
     body.querySelectorAll("[data-remove]").forEach((button) => {
       button.addEventListener("click", () => {
         const index = Number(button.dataset.remove);
-        if (window.confirm("ยกเลิกรายการ " + items[index].label + " ใช่ไหม?")) {
+        captureEditsFromForm();
+        if (items[index] && window.confirm("ยกเลิกรายการ " + items[index].label + " ใช่ไหม?")) {
           items.splice(index, 1);
           render();
         }
@@ -451,8 +544,7 @@ const LIFF_ENHANCEMENTS = String.raw`<script>
   }
 
   async function save() {
-    document.querySelectorAll(".item-row input").forEach((input) => { items[Number(input.dataset.idx)].qty = input.value.trim(); });
-    document.querySelectorAll(".supplier-select").forEach((select) => { items[Number(select.dataset.supplierIdx)].supplier = select.value; });
+    captureEditsFromForm();
     if (unmatchedMode && items.some((item) => !item.supplier)) {
       window.alert("กรุณาเลือกซัพพลายเออร์ให้ทุกรายการ หรือกด × เพื่อลบรายการที่ไม่ต้องการ");
       return;
@@ -575,13 +667,17 @@ export default {
             }
 
             const { bySupplier, supplierOrder, unmatched } = lnParseMessageIntoSupplierGroups(event.message.text, dict, aliasTable);
-            const pendingId = lnGenId("p");
-            await env.KOPI_KV.put(
-              "line_pending:" + pendingId,
-              JSON.stringify({ bySupplier, supplierOrder, unmatched, createdAt: Date.now(), userId: senderId, submittedByAdmin: isAdminLineUser(env, senderId, activeAdminId) }),
-              { expirationTtl: PENDING_TTL_SECONDS }
-            );
-            const flexMessage = buildOrderFlexMessage(bySupplier, supplierOrder, unmatched, pendingId, liffBaseUrl);
+            const metadata = { userId: senderId, submittedByAdmin: isAdminLineUser(env, senderId, activeAdminId) };
+            const draftBubbles = [];
+            for (const supplierName of supplierOrder) {
+              const draft = await upsertSupplierDraft(env.KOPI_KV, activeAdminId, supplierName, bySupplier[supplierName], metadata);
+              draftBubbles.push(buildSupplierBubble(supplierName, draft.record.bySupplier[supplierName], draft.pendingId, liffBaseUrl));
+            }
+            if (unmatched.length) {
+              const unmatchedDraft = await upsertUnmatchedDraft(env.KOPI_KV, activeAdminId, unmatched, metadata);
+              draftBubbles.push(buildUnmatchedBubble(unmatchedDraft.record.unmatched, unmatchedDraft.pendingId, liffBaseUrl));
+            }
+            const flexMessage = buildAdminDraftFlexMessage(draftBubbles);
 
             // Every order card goes only to the admin's 1:1 chat with the bot.
             // Staff (and people in a shared group) receive an acknowledgement only,
@@ -632,6 +728,11 @@ export default {
               const pendingId = rest.slice(0, sepIdx);
               const supplierName = decodeURIComponent(rest.slice(sepIdx + 1));
               const record = await env.KOPI_KV.get("line_pending:" + pendingId, { type: "json" });
+              if (record && record.sentSuppliers && record.sentSuppliers[supplierName]) {
+                const alreadySent = await lineReply(event.replyToken, [{ type: "text", text: "หมวด " + supplierName + " ถูกส่งไปแล้วครับ รายการใหม่จะขึ้นเป็นการ์ดใหม่" }], env.LINE_CHANNEL_ACCESS_TOKEN);
+                if (!alreadySent.ok) console.error("[line already-sent reply failed]", alreadySent.status, await alreadySent.text());
+                continue;
+              }
               const items = record && record.bySupplier ? (record.bySupplier[supplierName] || []) : [];
               const text = items.length
                 ? formatSupplierPlainText(supplierName, items)
@@ -639,6 +740,11 @@ export default {
               const pbRes = await lineReply(event.replyToken, [{ type: "text", text }], env.LINE_CHANNEL_ACCESS_TOKEN);
               if (!pbRes.ok) {
                 console.error("[line postback reply failed]", pbRes.status, await pbRes.text());
+              } else if (record && items.length) {
+                record.sentSuppliers = Object.assign({}, record.sentSuppliers, { [supplierName]: Date.now() });
+                await env.KOPI_KV.put("line_pending:" + pendingId, JSON.stringify(record), { expirationTtl: PENDING_TTL_SECONDS });
+                const key = draftKey(activeAdminId, supplierName);
+                if (await env.KOPI_KV.get(key) === pendingId) await env.KOPI_KV.delete(key);
               }
 
             } else if (data.startsWith("editsup:")) {
@@ -805,6 +911,7 @@ export default {
           if (!Array.isArray(record.supplierOrder)) record.supplierOrder = Object.keys(record.bySupplier);
           addedSuppliers.forEach((name) => { if (!record.supplierOrder.includes(name)) record.supplierOrder.push(name); });
           await env.KOPI_KV.put("line_pending:" + id, JSON.stringify(record), { expirationTtl: PENDING_TTL_SECONDS });
+          await pushLatestDraftCard(env, owner.userId, id, record, "จัดกลุ่มรายการที่ยังไม่แมทแล้ว");
           return Response.json({ suppliers: addedSuppliers, items: [] });
         }
         allowedSuppliers.add(supplier);
@@ -842,6 +949,7 @@ export default {
           if (nextBySupplier[name] && !record.supplierOrder.includes(name)) record.supplierOrder.push(name);
         });
         await env.KOPI_KV.put("line_pending:" + id, JSON.stringify(record), { expirationTtl: PENDING_TTL_SECONDS });
+        await pushLatestDraftCard(env, owner.userId, id, record, "ออเดอร์ " + supplier + " ถูกแก้ไขแล้ว");
         return Response.json({ supplier, items: record.bySupplier[supplier] || [] });
       }
       return new Response("Method not allowed", { status: 405 });
