@@ -684,23 +684,26 @@ export default {
               .normalize("NFKC")
               .replace(/[\u200B-\u200D\uFEFF]/g, "")
               .trim();
-            const setupMatch = setupText.match(/^#\s*ตั้งแอดมิน\s+(.+?)\s*$/);
+            const setupMatch = setupText.match(/^#\s*(ตั้งแอดมิน|สลับแอดมิน)\s+(.+?)\s*$/);
             const pairedAdminId = await env.KOPI_KV.get(ACTIVE_ADMIN_KEY);
             if (setupMatch) {
-              const providedCode = setupMatch[1].normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+              const forceSwitch = setupMatch[1] === "สลับแอดมิน";
+              const providedCode = setupMatch[2].normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
               const expectedCode = String(env.ADMIN_SETUP_CODE || "").normalize("NFKC").trim();
               let setupReplyText;
               if (!senderId) {
                 setupReplyText = "ตั้งค่าแอดมินได้เฉพาะในแชตส่วนตัวกับบอตครับ";
-              } else if (pairedAdminId) {
-                setupReplyText = "ระบบมีแอดมินที่จับคู่แล้ว จึงไม่เปลี่ยนเครื่องอัตโนมัติครับ";
               } else if (!expectedCode) {
                 setupReplyText = "ระบบยังไม่ได้ตั้งรหัสจับคู่แอดมินครับ";
               } else if (providedCode !== expectedCode) {
                 setupReplyText = "รหัสจับคู่ไม่ถูกต้อง กรุณาคัดลอกคำสั่งจากแอดมินระบบอีกครั้งครับ";
+              } else if (pairedAdminId && !forceSwitch) {
+                setupReplyText = "ระบบมีแอดมินที่จับคู่แล้ว หากต้องการย้ายเครื่องให้ใช้คำสั่ง #สลับแอดมิน ตามด้วยรหัสครับ";
               } else {
                 await env.KOPI_KV.put(ACTIVE_ADMIN_KEY, senderId);
-                setupReplyText = "ตั้งค่าเครื่องนี้เป็นแอดมินแล้ว ✅ รายการใหม่จะถูกส่งมาที่แชตนี้";
+                setupReplyText = forceSwitch
+                  ? "สลับเครื่องแอดมินแล้ว ✅ รายการใหม่จะถูกส่งมาที่แชตนี้"
+                  : "ตั้งค่าเครื่องนี้เป็นแอดมินแล้ว ✅ รายการใหม่จะถูกส่งมาที่แชตนี้";
               }
               const pairedReply = await lineReply(
                 event.replyToken,
