@@ -374,7 +374,10 @@ async function upsertSupplierDraft(kv, adminId, supplier, items, metadata){
   const existingId = await kv.get(key);
   let pendingId = existingId || lnGenId("p");
   let record = existingId ? await kv.get("line_pending:" + existingId, { type: "json" }) : null;
-  if (!record || record.sentSuppliers && record.sentSuppliers[supplier]) {
+  const validRecord = record && typeof record === "object" && record.bySupplier && typeof record.bySupplier === "object" && !Array.isArray(record.bySupplier);
+  // Old cards can point at an expired or pre-draft-format record. Start a fresh
+  // draft for that supplier instead of letting one stale KV value block delivery.
+  if (!validRecord || record.sentSuppliers && record.sentSuppliers[supplier]) {
     pendingId = lnGenId("p");
     record = { bySupplier: {}, supplierOrder: [supplier], unmatched: [], createdAt: Date.now(), userId: metadata.userId, submittedByAdmin: metadata.submittedByAdmin, sentSuppliers: {} };
   }
@@ -393,7 +396,7 @@ async function upsertUnmatchedDraft(kv, adminId, items, metadata){
   const existingId = await kv.get(key);
   let pendingId = existingId || lnGenId("p");
   let record = existingId ? await kv.get("line_pending:" + existingId, { type: "json" }) : null;
-  if (!record) {
+  if (!record || typeof record !== "object" || !record.bySupplier || typeof record.bySupplier !== "object" || Array.isArray(record.bySupplier)) {
     record = { bySupplier: {}, supplierOrder: [], unmatched: [], createdAt: Date.now(), userId: metadata.userId, submittedByAdmin: metadata.submittedByAdmin, sentSuppliers: {} };
   }
   record.unmatched = mergeDraftItems(record.unmatched, items);
@@ -743,6 +746,7 @@ export default {
             const metadata = { userId: senderId, submittedByAdmin: isAdminLineUser(env, senderId, activeAdminId) };
             const draftBubbles = [];
             for (const supplierName of supplierOrder) {
+              console.log("[line draft upsert]", "supplier=", supplierName);
               const draft = await upsertSupplierDraft(env.KOPI_KV, activeAdminId, supplierName, bySupplier[supplierName], metadata);
               draftBubbles.push(buildSupplierBubble(supplierName, draft.record.bySupplier[supplierName], draft.pendingId, liffBaseUrl));
             }
@@ -910,7 +914,7 @@ export default {
           }
         } catch (e) {
           // One bad event shouldn't 500 the whole webhook batch — LINE retries on non-200.
-          console.error("[webhook event error]", (e && e.stack) || e);
+          console.log("[webhook event error]", (e && (e.stack || e.message)) || String(e));
         }
       }
       return new Response("OK", { status: 200 });
