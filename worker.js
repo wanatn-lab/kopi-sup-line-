@@ -768,8 +768,6 @@ export default {
             const { bySupplier, supplierOrder, unmatched } = lnParseMessageIntoSupplierGroups(event.message.text, dict, aliasTable);
             console.log("[line order parsed]", "suppliers=", supplierOrder.length, "unmatched=", unmatched.length);
             const senderIsAdmin = isAdminLineUser(env, senderId, activeAdminId);
-            const metadata = { userId: senderId, submittedByAdmin: senderIsAdmin };
-
             // Keep admin delivery independent from the rich card. If draft
             // aggregation or Flex validation has a problem, the admin still
             // receives the actual order as a readable LINE text message.
@@ -783,35 +781,27 @@ export default {
               console.error("[line admin notification failed]", notificationRes.status, await notificationRes.text());
             }
 
-            let flexMessage;
-            try {
-              const draftBubbles = [];
-              for (const supplierName of supplierOrder) {
-                const draft = await upsertSupplierDraft(env.KOPI_KV, activeAdminId, supplierName, bySupplier[supplierName], metadata);
-                draftBubbles.push(buildSupplierBubble(supplierName, draft.record.bySupplier[supplierName], draft.pendingId, liffBaseUrl));
-              }
-              if (unmatched.length) {
-                const unmatchedDraft = await upsertUnmatchedDraft(env.KOPI_KV, activeAdminId, unmatched, metadata);
-                draftBubbles.push(buildUnmatchedBubble(unmatchedDraft.record.unmatched, unmatchedDraft.pendingId, liffBaseUrl));
-              }
-              flexMessage = buildAdminDraftFlexMessage(draftBubbles);
-            } catch (draftError) {
-              // Never discard a staff order because an older open-draft record is
-              // unavailable. Preserve the complete message as a fresh card instead.
-              console.log("[line draft recovery]", (draftError && (draftError.message || draftError.stack)) || String(draftError));
-              const fallbackPendingId = lnGenId("p");
-              const fallbackRecord = {
-                bySupplier,
-                supplierOrder,
-                unmatched,
-                createdAt: Date.now(),
-                userId: senderId,
-                submittedByAdmin: metadata.submittedByAdmin,
-                sentSuppliers: {}
-              };
-              await env.KOPI_KV.put("line_pending:" + fallbackPendingId, JSON.stringify(fallbackRecord), { expirationTtl: PENDING_TTL_SECONDS });
-              flexMessage = buildOrderFlexMessage(bySupplier, supplierOrder, unmatched, fallbackPendingId, liffBaseUrl);
-            }
+            // Store this exact incoming order as one editable card before doing
+            // any optional draft aggregation. The previous per-supplier merge
+            // could stall after the first KV update, leaving admin with text
+            // only and no controls. A single pending record preserves every
+            // supplier plus unmatched items for LIFF editing and moving items.
+            const pendingId = lnGenId("p");
+            const pendingRecord = {
+              bySupplier,
+              supplierOrder,
+              unmatched,
+              createdAt: Date.now(),
+              userId: senderId,
+              submittedByAdmin: senderIsAdmin,
+              sentSuppliers: {}
+            };
+            await env.KOPI_KV.put(
+              "line_pending:" + pendingId,
+              JSON.stringify(pendingRecord),
+              { expirationTtl: PENDING_TTL_SECONDS }
+            );
+            const flexMessage = buildOrderFlexMessage(bySupplier, supplierOrder, unmatched, pendingId, liffBaseUrl);
 
             // The card is deliberately a second request. See
             // buildAdminOrderNotification: an invalid Flex payload must never
