@@ -352,6 +352,30 @@ function buildAdminDraftFlexMessage(bubbles){
   };
 }
 
+// Send this lightweight notification before building or pushing a Flex card.
+// LINE rejects the *whole* messages array when any Flex message is malformed,
+// so combining the notification and card can make an otherwise received order
+// invisible to the admin.
+function buildAdminOrderNotification(bySupplier, supplierOrder, unmatched, senderIsAdmin){
+  const heading = senderIsAdmin
+    ? "📩 รายการใหม่จากแอดมิน"
+    : "📩 รายการใหม่จากพนักงาน — รอตรวจสอบก่อนส่งซัพพลายเออร์";
+  const lines = [heading];
+  (supplierOrder || []).forEach((supplier) => {
+    const items = Array.isArray(bySupplier && bySupplier[supplier]) ? bySupplier[supplier] : [];
+    lines.push("\n📦 " + supplier);
+    items.forEach((item) => lines.push("• " + item.label + " " + (item.qty || "?") + " " + (item.unit || "")));
+  });
+  if (Array.isArray(unmatched) && unmatched.length) {
+    lines.push("\n⚠️ ยังไม่จัดซัพ");
+    unmatched.forEach((item) => lines.push("• " + item.label + " " + (item.qty || "?") + " " + (item.unit || "")));
+  }
+  const text = lines.join("\n").trim();
+  // LINE text messages allow up to 5,000 characters. Keep the beginning,
+  // including the supplier labels, when a staff member submits a long list.
+  return text.length > 4900 ? text.slice(0, 4880) + "\n… (ดูรายการเต็มในบัตรด้านล่าง)" : text;
+}
+
 function draftKey(adminId, name){
   return "line_open_draft:" + encodeURIComponent(adminId) + ":" + encodeURIComponent(name);
 }
@@ -743,7 +767,22 @@ export default {
 
             const { bySupplier, supplierOrder, unmatched } = lnParseMessageIntoSupplierGroups(event.message.text, dict, aliasTable);
             console.log("[line order parsed]", "suppliers=", supplierOrder.length, "unmatched=", unmatched.length);
-            const metadata = { userId: senderId, submittedByAdmin: isAdminLineUser(env, senderId, activeAdminId) };
+            const senderIsAdmin = isAdminLineUser(env, senderId, activeAdminId);
+            const metadata = { userId: senderId, submittedByAdmin: senderIsAdmin };
+
+            // Keep admin delivery independent from the rich card. If draft
+            // aggregation or Flex validation has a problem, the admin still
+            // receives the actual order as a readable LINE text message.
+            const notificationRes = await linePush(
+              activeAdminId,
+              [{ type: "text", text: buildAdminOrderNotification(bySupplier, supplierOrder, unmatched, senderIsAdmin) }],
+              env.LINE_CHANNEL_ACCESS_TOKEN
+            );
+            console.log("[line admin notification]", "status=", notificationRes.status);
+            if (!notificationRes.ok) {
+              console.error("[line admin notification failed]", notificationRes.status, await notificationRes.text());
+            }
+
             let flexMessage;
             try {
               const draftBubbles = [];
@@ -774,21 +813,17 @@ export default {
               flexMessage = buildOrderFlexMessage(bySupplier, supplierOrder, unmatched, fallbackPendingId, liffBaseUrl);
             }
 
-            // Every order card goes only to the admin's 1:1 chat with the bot.
-            // Staff (and people in a shared group) receive an acknowledgement only,
-            // so they cannot see or operate supplier-send/edit controls.
-            const senderIsAdmin = isAdminLineUser(env, senderId, activeAdminId);
-            const sourceText = senderIsAdmin
-              ? "📩 รายการใหม่จากแอดมิน"
-              : "📩 รายการใหม่จากพนักงาน — รอตรวจสอบก่อนส่งซัพพลายเออร์";
+            // The card is deliberately a second request. See
+            // buildAdminOrderNotification: an invalid Flex payload must never
+            // prevent the plain order notification above from reaching admin.
             const pushRes = await linePush(
               activeAdminId,
-              [{ type: "text", text: sourceText }, flexMessage],
+              [flexMessage],
               env.LINE_CHANNEL_ACCESS_TOKEN
             );
-            console.log("[line order routing]", "fromAdmin=", senderIsAdmin, "pushStatus=", pushRes.status, "ackStatus=", ackRes.status);
+            console.log("[line order card]", "fromAdmin=", senderIsAdmin, "pushStatus=", pushRes.status, "notificationStatus=", notificationRes.status, "ackStatus=", ackRes.status);
             if (!pushRes.ok) {
-              console.error("[line push to admin failed]", pushRes.status, await pushRes.text());
+              console.error("[line order card failed]", pushRes.status, await pushRes.text());
             }
 
           } else if (event.type === "postback") {
