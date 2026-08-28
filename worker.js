@@ -224,13 +224,20 @@ function getKnownSuppliers(dict){
   return list;
 }
 function buildSupplierBubble(supplierName, items, pendingId, liffBaseUrl){
-  const rows = items.map(it => ({
+  // A Flex carousel can contain large orders, but a very tall body becomes
+  // unreliable on LINE clients (and can make the API request fail). The card
+  // is a preview only; the LIFF editor always loads the complete stored list.
+  const previewItems = (items || []).slice(0, 8);
+  const rows = previewItems.map(it => ({
     type: "box", layout: "horizontal",
     contents: [
       { type: "text", text: it.label, size: "sm", flex: 4, wrap: true, color: "#1f2937" },
       { type: "text", text: (it.qty || "?") + " " + (it.unit || ""), size: "sm", flex: 2, align: "end", color: "#6b7280" }
     ]
   }));
+  if ((items || []).length > previewItems.length) {
+    rows.push({ type: "text", text: "… อีก " + ((items || []).length - previewItems.length) + " รายการ — กดแก้ไขเพื่อดูทั้งหมด", size: "xs", color: "#6b7280", wrap: true });
+  }
   const bubble = {
     type: "bubble", size: "kilo",
     header: {
@@ -307,13 +314,18 @@ function buildEditItemsBubble(supplierName, items, pendingId){
   };
 }
 function buildUnmatchedBubble(unmatchedItems, pendingId, liffBaseUrl){
-  const rows = unmatchedItems.map(it => ({
+  const allItems = unmatchedItems || [];
+  const previewItems = allItems.slice(0, 8);
+  const rows = previewItems.map(it => ({
     type: "box", layout: "horizontal",
     contents: [
       { type: "text", text: it.label, size: "sm", flex: 4, wrap: true, color: "#7f1d1d" },
       { type: "text", text: (it.qty || "?") + " " + (it.unit || ""), size: "sm", flex: 2, align: "end", color: "#b91c1c" }
     ]
   }));
+  if (allItems.length > previewItems.length) {
+    rows.push({ type: "text", text: "… อีก " + (allItems.length - previewItems.length) + " รายการ — กดแก้ไขเพื่อจัดซัพทั้งหมด", size: "xs", color: "#b91c1c", wrap: true });
+  }
   return {
     type: "bubble", size: "kilo",
     header: {
