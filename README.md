@@ -19,7 +19,11 @@
 |---|---|---|
 | `LINE_CHANNEL_SECRET` | (ดูใน LINE Developers Console > Messaging API > Channel secret) | |
 | `LINE_CHANNEL_ACCESS_TOKEN` | (ดูใน LINE Developers Console > Messaging API > Channel access token — กด Reissue ถ้าไม่มี) | |
-| `LIFF_ID` หรือ `LIFF_BASE_URL` | (ถ้าทำหน้าแก้ไขจำนวนผ่าน LIFF) | ไม่ตั้งก็ยังใช้บอทหลักได้ปกติ |
+| `LIFF_ID` | LIFF ID จากแท็บ LIFF ของ LINE Developers Console | ต้องตั้งเพื่อเปิดหน้าพิมพ์จำนวน/ลบรายการ |
+| `LIFF_CHANNEL_ID` | Channel ID ของ LINE Login / LIFF channel เดียวกับ LIFF app | ใช้ยืนยันตัวตนแอดมินบน Worker |
+| `OWNER_LINE_USER_ID` | LINE user ID ของแอดมิน | รับการ์ดออเดอร์, กดแก้ไข/ส่งซัพพลายเออร์ และใช้ API ได้คนเดียว |
+| `ADMIN_LINE_USER_IDS` | LINE user ID เพิ่มเติม คั่นด้วย `,` (ไม่บังคับ) | เพิ่มผู้จัดการที่กดแก้ไข/ส่งได้; การ์ดออเดอร์ยังส่งไปที่ `OWNER_LINE_USER_ID` |
+| `LIFF_BASE_URL` | `https://liff.line.me/<LIFF_ID>` (ไม่บังคับ) | ปกติไม่ต้องตั้ง เพราะระบบสร้างจาก `LIFF_ID` ให้เอง |
 
 **สำคัญ:** หลังแก้ Settings ทุกครั้ง ต้องเข้าไปที่แท็บ **Deployments** แล้วกด **Promote version** ที่เวอร์ชันล่าสุด ไม่งั้น Cloudflare จะยังใช้เวอร์ชันเก่าอยู่ (จุดที่ทำให้บอทไม่ตอบมาแล้วรอบนึง)
 
@@ -27,6 +31,21 @@
 | Variable name | ประเภท | ค่า |
 |---|---|---|
 | `KOPI_KV` | KV Namespace | `kopi-order-cloud-state` |
+
+## ตั้งค่า LIFF สำหรับแก้ไขออเดอร์
+
+1. ใน LINE Developers Console สร้าง/เลือก LIFF app ที่ผูกกับ channel เดียวกับบอต แล้วตั้ง **Endpoint URL** เป็น `https://supplier-order.wanat-n.workers.dev/liff`.
+2. เปิด scope อย่างน้อย `openid` เพื่อให้ Worker ยืนยันว่าเป็น LINE ของแอดมินจริง.
+3. ตั้งค่า `LIFF_ID`, `LIFF_CHANNEL_ID` และ `OWNER_LINE_USER_ID` ตามตารางข้างต้น แล้ว Promote deployment ของ Worker.
+4. ที่หน้า **Roles** ของ channel เชิญ LINE Business ID ที่ใช้ทดสอบเป็น **Admin** หรือ **Tester** แล้วกดรับคำเชิญ. ขณะ channel อยู่สถานะ **Developing** ผู้ที่ไม่มี role จะเปิด LIFF ไม่ได้และ LINE จะแสดง `400 Bad Request` แบบในภาพ.
+
+ปุ่ม **✏️ แก้ไข** จะเปิด LIFF ให้พิมพ์จำนวนตรง ๆ หรือกด **×** เพื่อลบรายการนั้น แล้วกลับไปกด **ส่งเลย** ในแชทได้ทันที. ปุ่ม **🔀 ย้ายซัพ** ในแชทยังใช้จัดกลุ่มไปซัพพลายเออร์อื่นได้เหมือนเดิม.
+
+## สิทธิ์พนักงานและแอดมิน
+
+- ทุกคนส่งข้อความรายการสั่งของเข้าบอตได้ แต่จะได้รับเพียงข้อความตอบรับ
+- การ์ดสรุปที่มีปุ่ม **แก้ไข / ย้ายซัพ / ส่งเลย** ถูกส่งไปยังแชตส่วนตัวของแอดมินเท่านั้น
+- ผู้ที่ไม่ใช่แอดมินกด postback ที่คัดลอกมาไม่ได้ และไม่สามารถใช้หน้า LIFF แก้ไขออเดอร์ได้
 
 ## LINE Official Account
 - Provider: Kopi Order Cloud
