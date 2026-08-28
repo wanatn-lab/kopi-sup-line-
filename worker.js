@@ -26,6 +26,16 @@ const UNIT_WORDS_LINE = ["กิโลกรัม","กก\\.?","โล","ถ�
 const UNIT_REGEX_LINE = new RegExp("^(.*?)\\s*([\\d]+(?:\\.\\d+)?)\\s*(" + UNIT_WORDS_LINE.join("|") + ")?\\s*$");
 const STORE_NAMES_LINE = ["ร้านโกปี๊ หลังโรงไม้", "The Old Offset"];
 const PENDING_TTL_SECONDS = 60 * 60 * 24 * 2; // 2 days — plenty for "approve later today/tomorrow"
+const OCR_SPACE_ENDPOINT = "https://api.ocr.space/parse/image";
+const OCR_SPACE_MAX_UPLOAD_BYTES = 1_000_000;
+// OCR.space Free accepts images up to 1 MB. Cloudflare Images transformations
+// progressively lower the image dimensions/quality, while retaining a readable
+// full-page image for the Thai order list.
+const OCR_RESIZE_PRESETS = [
+  { width: 1600, height: 2200, quality: 65 },
+  { width: 1280, height: 1800, quality: 55 },
+  { width: 1024, height: 1440, quality: 45 }
+];
 
 function lnNormalize(s){
   return (s||"").toString().toLowerCase().replace(/[\s().*=\-–—:：]/g,"");
@@ -192,6 +202,75 @@ async function linePush(userId, messages, accessToken){
   });
 }
 
+function truncateLineText(text, limit){
+  const normalized = String(text || "").trim();
+  return normalized.length > limit ? normalized.slice(0, limit - 20) + "\n… (ข้อความถูกตัดทอน)" : normalized;
+}
+
+// LINE keeps original message content behind an authenticated URL. Image
+// transformations forward that authorization only inside this Worker, and the
+// transformed bytes are never exposed through a public endpoint.
+async function fetchCompressedLineImage(messageId, accessToken){
+  const contentUrl = "https://api-data.line.me/v2/bot/message/" + encodeURIComponent(messageId) + "/content";
+  let lastReason = "";
+
+  for (const preset of OCR_RESIZE_PRESETS){
+    const response = await fetch(contentUrl, {
+      headers: { "Authorization": "Bearer " + accessToken },
+      cf: {
+        image: {
+          fit: "scale-down",
+          width: preset.width,
+          height: preset.height,
+          quality: preset.quality,
+          format: "jpeg",
+          "origin-auth": "share-publicly"
+        }
+      }
+    });
+
+    if (!response.ok){
+      lastReason = "ไม่สามารถย่อรูปได้ (HTTP " + response.status + ")";
+      continue;
+    }
+
+    const image = await response.blob();
+    if (image.size > 0 && image.size <= OCR_SPACE_MAX_UPLOAD_BYTES) return image;
+    lastReason = "รูปยังมีขนาด " + Math.ceil(image.size / 1024) + " KB หลังย่อแล้ว";
+  }
+
+  throw new Error(lastReason || "ไม่สามารถย่อรูปให้เล็กกว่า 1 MB ได้");
+}
+
+async function extractTextFromLineImage(messageId, env){
+  if (!env.OCR_SPACE_API_KEY) throw new Error("ยังไม่ได้ตั้งค่า OCR_SPACE_API_KEY");
+  if (!env.LINE_CHANNEL_ACCESS_TOKEN) throw new Error("ยังไม่ได้ตั้งค่า LINE_CHANNEL_ACCESS_TOKEN");
+
+  const image = await fetchCompressedLineImage(messageId, env.LINE_CHANNEL_ACCESS_TOKEN);
+  const form = new FormData();
+  form.append("file", image, "line-order.jpg");
+  form.append("language", "tha");
+  form.append("OCREngine", "2");
+  form.append("isOverlayRequired", "false");
+
+  const response = await fetch(OCR_SPACE_ENDPOINT, {
+    method: "POST",
+    headers: { "apikey": env.OCR_SPACE_API_KEY },
+    body: form
+  });
+  if (!response.ok) throw new Error("OCR.space ตอบกลับ HTTP " + response.status);
+
+  let result;
+  try { result = await response.json(); } catch (error) { throw new Error("OCR.space ตอบกลับข้อมูลไม่ถูกต้อง"); }
+  if (result.IsErroredOnProcessing) {
+    const detail = Array.isArray(result.ErrorMessage) ? result.ErrorMessage.join(" ") : result.ErrorMessage;
+    throw new Error(detail || "OCR.space อ่านรูปไม่สำเร็จ");
+  }
+  const text = (result.ParsedResults || []).map((entry) => entry && entry.ParsedText || "").join("\n").trim();
+  if (!text) throw new Error("ไม่พบข้อความในรูป");
+  return { text, imageBytes: image.size };
+}
+
 // The order controls must never be sent to the person who placed an order.
 // Keep the original single-admin setting, while allowing an optional comma-separated
 // ADMIN_LINE_USER_IDS list if another manager is added later.
@@ -355,6 +434,23 @@ function buildOrderFlexMessage(bySupplier, supplierOrder, unmatched, pendingId, 
   };
 }
 
+// A sent supplier must remain in the saved record (for the audit trail and to
+// prevent duplicate sends), but it must never reappear on later "latest"
+// cards. LINE cannot delete a message that has already been delivered, so each
+// refresh shows only the categories still awaiting action.
+function getOpenSupplierOrder(record){
+  const sent = record && record.sentSuppliers || {};
+  return (record && (record.supplierOrder || Object.keys(record.bySupplier || {})) || [])
+    .filter((supplier) => !sent[supplier])
+    .filter((supplier) => Array.isArray(record && record.bySupplier && record.bySupplier[supplier]) && record.bySupplier[supplier].length);
+}
+
+function buildOpenOrderFlexMessage(record, pendingId, liffBaseUrl){
+  const supplierOrder = getOpenSupplierOrder(record);
+  const unmatched = Array.isArray(record && record.unmatched) ? record.unmatched : [];
+  return buildOrderFlexMessage(record && record.bySupplier || {}, supplierOrder, unmatched, pendingId, liffBaseUrl);
+}
+
 function buildAdminDraftFlexMessage(bubbles){
   if (!bubbles.length) return { type: "text", text: "ไม่พบรายการที่ส่งต่อให้แอดมิน" };
   return {
@@ -445,12 +541,10 @@ async function upsertUnmatchedDraft(kv, adminId, items, metadata){
 async function pushLatestDraftCard(env, adminUserId, pendingId, record, notice){
   if (!env.LINE_CHANNEL_ACCESS_TOKEN || !adminUserId || !record) return;
   const liffBaseUrl = env.LIFF_ID ? (env.LIFF_BASE_URL || ("https://liff.line.me/" + env.LIFF_ID)) : "";
-  const supplierOrder = (record.supplierOrder || Object.keys(record.bySupplier || {}))
-    .filter((supplier) => Array.isArray(record.bySupplier && record.bySupplier[supplier]) && record.bySupplier[supplier].length);
-  const summary = buildOrderFlexMessage(record.bySupplier || {}, supplierOrder, record.unmatched || [], pendingId, liffBaseUrl);
+  const summary = buildOpenOrderFlexMessage(record, pendingId, liffBaseUrl);
   const cardMessage = summary.type === "flex"
     ? summary
-    : { type: "text", text: summary.text || "ออเดอร์นี้ไม่มีรายการเหลือแล้ว" };
+    : { type: "text", text: "✅ " + notice + " — ไม่มีรายการค้างส่งแล้ว" };
   const response = await linePush(
     adminUserId,
     [{ type: "text", text: "✏️ อัปเดตล่าสุด: " + notice }, cardMessage],
@@ -464,6 +558,43 @@ function formatSupplierPlainText(supplierName, items){
   let text = "รายการสั่งของวันที่ " + date + "\n- ซัพพลายเออร์ " + supplierName + ":\n";
   items.forEach(it => { text += "  • " + it.label + " " + (it.qty || "?") + " " + (it.unit || "") + "\n"; });
   return text.trim();
+}
+
+// The text notification and the interactive Flex card are deliberately separate
+// pushes. If a card becomes invalid, the admin still receives the parsed order.
+async function saveAndSendParsedOrder(env, options){
+  const { activeAdminId, senderId, rawText, senderIsAdmin, dict, aliasTable, liffBaseUrl, source } = options;
+  const { bySupplier, supplierOrder, unmatched } = lnParseMessageIntoSupplierGroups(rawText, dict, aliasTable);
+  console.log("[line order parsed]", "source=", source, "suppliers=", supplierOrder.length, "unmatched=", unmatched.length);
+
+  const notificationRes = await linePush(
+    activeAdminId,
+    [{ type: "text", text: buildAdminOrderNotification(bySupplier, supplierOrder, unmatched, senderIsAdmin) }],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+  if (!notificationRes.ok) console.error("[line admin notification failed]", notificationRes.status, await notificationRes.text());
+
+  const pendingId = lnGenId("p");
+  const pendingRecord = {
+    bySupplier,
+    supplierOrder,
+    unmatched,
+    createdAt: Date.now(),
+    userId: senderId,
+    submittedByAdmin: senderIsAdmin,
+    source: source || "text",
+    sentSuppliers: {}
+  };
+  await env.KOPI_KV.put(
+    "line_pending:" + pendingId,
+    JSON.stringify(pendingRecord),
+    { expirationTtl: PENDING_TTL_SECONDS }
+  );
+
+  const flexMessage = buildOrderFlexMessage(bySupplier, supplierOrder, unmatched, pendingId, liffBaseUrl);
+  const pushRes = await linePush(activeAdminId, [flexMessage], env.LINE_CHANNEL_ACCESS_TOKEN);
+  if (!pushRes.ok) console.error("[line order card failed]", pushRes.status, await pushRes.text());
+  return { pendingId, supplierOrder, unmatched, notificationStatus: notificationRes.status, cardStatus: pushRes.status };
 }
 
 // A LIFF URL contains a pending-order ID, but it is not authentication. Verify
@@ -777,55 +908,72 @@ export default {
               console.error("[line order acknowledgement failed]", ackRes.status, await ackRes.text());
             }
 
-            const { bySupplier, supplierOrder, unmatched } = lnParseMessageIntoSupplierGroups(event.message.text, dict, aliasTable);
-            console.log("[line order parsed]", "suppliers=", supplierOrder.length, "unmatched=", unmatched.length);
             const senderIsAdmin = isAdminLineUser(env, senderId, activeAdminId);
-            // Keep admin delivery independent from the rich card. If draft
-            // aggregation or Flex validation has a problem, the admin still
-            // receives the actual order as a readable LINE text message.
-            const notificationRes = await linePush(
+            const delivery = await saveAndSendParsedOrder(env, {
               activeAdminId,
-              [{ type: "text", text: buildAdminOrderNotification(bySupplier, supplierOrder, unmatched, senderIsAdmin) }],
-              env.LINE_CHANNEL_ACCESS_TOKEN
-            );
-            console.log("[line admin notification]", "status=", notificationRes.status);
-            if (!notificationRes.ok) {
-              console.error("[line admin notification failed]", notificationRes.status, await notificationRes.text());
+              senderId,
+              rawText: event.message.text,
+              senderIsAdmin,
+              dict,
+              aliasTable,
+              liffBaseUrl,
+              source: "text"
+            });
+            console.log("[line order card]", "fromAdmin=", senderIsAdmin, "pushStatus=", delivery.cardStatus, "notificationStatus=", delivery.notificationStatus, "ackStatus=", ackRes.status);
+
+          } else if (event.type === "message" && event.message && event.message.type === "image") {
+            const senderId = (event.source || {}).userId || null;
+            const activeAdminId = await getActiveAdminId(env);
+            if (!activeAdminId) {
+              const configReply = await lineReply(
+                event.replyToken,
+                [{ type: "text", text: "ระบบยังไม่ได้ตั้งค่าแอดมิน จึงยังรับออเดอร์ไม่ได้" }],
+                env.LINE_CHANNEL_ACCESS_TOKEN
+              );
+              if (!configReply.ok) console.error("[line image admin-config reply failed]", configReply.status, await configReply.text());
+              continue;
             }
 
-            // Store this exact incoming order as one editable card before doing
-            // any optional draft aggregation. The previous per-supplier merge
-            // could stall after the first KV update, leaving admin with text
-            // only and no controls. A single pending record preserves every
-            // supplier plus unmatched items for LIFF editing and moving items.
-            const pendingId = lnGenId("p");
-            const pendingRecord = {
-              bySupplier,
-              supplierOrder,
-              unmatched,
-              createdAt: Date.now(),
-              userId: senderId,
-              submittedByAdmin: senderIsAdmin,
-              sentSuppliers: {}
-            };
-            await env.KOPI_KV.put(
-              "line_pending:" + pendingId,
-              JSON.stringify(pendingRecord),
-              { expirationTtl: PENDING_TTL_SECONDS }
-            );
-            const flexMessage = buildOrderFlexMessage(bySupplier, supplierOrder, unmatched, pendingId, liffBaseUrl);
-
-            // The card is deliberately a second request. See
-            // buildAdminOrderNotification: an invalid Flex payload must never
-            // prevent the plain order notification above from reaching admin.
-            const pushRes = await linePush(
-              activeAdminId,
-              [flexMessage],
+            const ackRes = await lineReply(
+              event.replyToken,
+              [{ type: "text", text: "รับรูปแล้วครับ ✅ กำลังอ่านรายการและส่งให้แอดมินตรวจสอบ" }],
               env.LINE_CHANNEL_ACCESS_TOKEN
             );
-            console.log("[line order card]", "fromAdmin=", senderIsAdmin, "pushStatus=", pushRes.status, "notificationStatus=", notificationRes.status, "ackStatus=", ackRes.status);
-            if (!pushRes.ok) {
-              console.error("[line order card failed]", pushRes.status, await pushRes.text());
+            if (!ackRes.ok) console.error("[line image acknowledgement failed]", ackRes.status, await ackRes.text());
+
+            try {
+              const ocr = await extractTextFromLineImage(event.message.id, env);
+              const senderIsAdmin = isAdminLineUser(env, senderId, activeAdminId);
+              const ocrTextRes = await linePush(
+                activeAdminId,
+                [{
+                  type: "text",
+                  text: truncateLineText("🖼️ ข้อความที่อ่านจากรูป — กรุณาตรวจแก้ก่อนส่งซัพพลายเออร์\n\n" + ocr.text, 4900)
+                }],
+                env.LINE_CHANNEL_ACCESS_TOKEN
+              );
+              if (!ocrTextRes.ok) console.error("[line OCR text push failed]", ocrTextRes.status, await ocrTextRes.text());
+
+              const delivery = await saveAndSendParsedOrder(env, {
+                activeAdminId,
+                senderId,
+                rawText: ocr.text,
+                senderIsAdmin,
+                dict,
+                aliasTable,
+                liffBaseUrl,
+                source: "ocr-image"
+              });
+              console.log("[line OCR order card]", "imageBytes=", ocr.imageBytes, "pushStatus=", delivery.cardStatus, "notificationStatus=", delivery.notificationStatus);
+            } catch (error) {
+              const reason = (error && error.message) || String(error);
+              console.error("[line OCR failed]", reason);
+              const failureRes = await linePush(
+                activeAdminId,
+                [{ type: "text", text: "⚠️ อ่านรูปออเดอร์ไม่สำเร็จ: " + truncateLineText(reason, 800) + "\nกรุณาขอให้พนักงานส่งรูปใหม่หรือพิมพ์รายการ" }],
+                env.LINE_CHANNEL_ACCESS_TOKEN
+              );
+              if (!failureRes.ok) console.error("[line OCR failure push failed]", failureRes.status, await failureRes.text());
             }
 
           } else if (event.type === "postback") {
@@ -868,6 +1016,7 @@ export default {
                 await env.KOPI_KV.put("line_pending:" + pendingId, JSON.stringify(record), { expirationTtl: PENDING_TTL_SECONDS });
                 const key = draftKey(activeAdminId, supplierName);
                 if (await env.KOPI_KV.get(key) === pendingId) await env.KOPI_KV.delete(key);
+                await pushLatestDraftCard(env, activeAdminId, pendingId, record, "ส่ง " + supplierName + " แล้ว");
               }
 
             } else if (data.startsWith("editsup:")) {
@@ -947,11 +1096,14 @@ export default {
                 record.bySupplier[destSupplier].push(moved);
                 if (!Array.isArray(record.supplierOrder)) record.supplierOrder = Object.keys(record.bySupplier);
                 if (!record.supplierOrder.includes(destSupplier)) record.supplierOrder.push(destSupplier);
+                // Moving a new item into a supplier that was already sent starts
+                // a fresh pending category for that supplier.
+                if (record.sentSuppliers && record.sentSuppliers[destSupplier]) delete record.sentSuppliers[destSupplier];
                 await env.KOPI_KV.put("line_pending:" + pendingId, JSON.stringify(record), { expirationTtl: PENDING_TTL_SECONDS });
               }
               const updated = await env.KOPI_KV.get("line_pending:" + pendingId, { type: "json" });
               const flexMessage = updated
-                ? buildOrderFlexMessage(updated.bySupplier, updated.supplierOrder || Object.keys(updated.bySupplier), updated.unmatched || [], pendingId, liffBaseUrl)
+                ? buildOpenOrderFlexMessage(updated, pendingId, liffBaseUrl)
                 : { type: "text", text: "ไม่พบออเดอร์นี้แล้ว (อาจหมดอายุ)" };
               const res = await lineReply(event.replyToken, [flexMessage], env.LINE_CHANNEL_ACCESS_TOKEN);
               if (!res.ok) console.error("[line moveto reply failed]", res.status, await res.text());
@@ -961,7 +1113,7 @@ export default {
               const pendingId = data.slice("back:".length);
               const record = await env.KOPI_KV.get("line_pending:" + pendingId, { type: "json" });
               const flexMessage = record
-                ? buildOrderFlexMessage(record.bySupplier, record.supplierOrder || Object.keys(record.bySupplier), record.unmatched || [], pendingId, liffBaseUrl)
+                ? buildOpenOrderFlexMessage(record, pendingId, liffBaseUrl)
                 : { type: "text", text: "ไม่พบออเดอร์นี้แล้ว (อาจหมดอายุ)" };
               const res = await lineReply(event.replyToken, [flexMessage], env.LINE_CHANNEL_ACCESS_TOKEN);
               if (!res.ok) console.error("[line back reply failed]", res.status, await res.text());
@@ -1034,6 +1186,7 @@ export default {
           record.unmatched = [];
           if (!Array.isArray(record.supplierOrder)) record.supplierOrder = Object.keys(record.bySupplier);
           addedSuppliers.forEach((name) => { if (!record.supplierOrder.includes(name)) record.supplierOrder.push(name); });
+          addedSuppliers.forEach((name) => { if (record.sentSuppliers) delete record.sentSuppliers[name]; });
           await env.KOPI_KV.put("line_pending:" + id, JSON.stringify(record), { expirationTtl: PENDING_TTL_SECONDS });
           await pushLatestDraftCard(env, owner.userId, id, record, "จัดกลุ่มรายการที่ยังไม่แมทแล้ว");
           return Response.json({ suppliers: addedSuppliers, items: [] });
@@ -1073,6 +1226,10 @@ export default {
         addedSuppliers.forEach((name) => {
           if (nextBySupplier[name] && !record.supplierOrder.includes(name)) record.supplierOrder.push(name);
         });
+        // If an edit moves/creates items under a supplier that was already
+        // sent, it becomes a new pending supplier card rather than being
+        // hidden by the previous sent marker.
+        addedSuppliers.forEach((name) => { if (record.sentSuppliers) delete record.sentSuppliers[name]; });
         await env.KOPI_KV.put("line_pending:" + id, JSON.stringify(record), { expirationTtl: PENDING_TTL_SECONDS });
         await pushLatestDraftCard(env, owner.userId, id, record, "ออเดอร์ " + supplier + " ถูกแก้ไขแล้ว");
         return Response.json({ supplier, items: record.bySupplier[supplier] || [] });
