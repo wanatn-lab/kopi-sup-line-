@@ -4,6 +4,15 @@ compatibility_date = "2026-08-10"
 account_id = "1de22e9a000512b62ee092d650d6cf3c"
 preview_urls = false
 
+[vars]
+# Hard guard before a LINE image is uploaded to Gemini. Lower this value if needed.
+GEMINI_DAILY_IMAGE_LIMIT = "10"
+# Google Drive OCR is enabled only after both Worker secrets are present.
+OCR_IMAGE_UPLOADS_ENABLED = "true"
+# Conservative hard cap for the no-cost Google Drive OCR path.
+GOOGLE_DRIVE_OCR_DAILY_LIMIT = "20"
+GOOGLE_DRIVE_OCR_WEB_APP_URL = "https://script.google.com/macros/s/AKfycbzYi6FDavsg0xM0tj1OvVe78zH7shhUQvyowEEs6NSSp_YuKrhnsho8eQp8OdbPVux1Pw/exec"
+
 [observability]
 enabled = true
 

@@ -23,6 +23,24 @@
 | `LIFF_CHANNEL_ID` | Channel ID ของ LINE Login / LIFF channel เดียวกับ LIFF app | ใช้ยืนยันตัวตนแอดมินบน Worker |
 | `OWNER_LINE_USER_ID` | LINE user ID ของแอดมิน | รับการ์ดออเดอร์, กดแก้ไข/ส่งซัพพลายเออร์ และใช้ API ได้คนเดียว |
 | `ADMIN_LINE_USER_IDS` | LINE user ID เพิ่มเติม คั่นด้วย `,` (ไม่บังคับ) | เพิ่มผู้จัดการที่กดแก้ไข/ส่งได้; การ์ดออเดอร์ยังส่งไปที่ `OWNER_LINE_USER_ID` |
+| `OCR_SPACE_API_KEY` | API key จาก OCR.space Free | ใช้อ่านรูปบิล/รายการสั่งของจาก LINE; ตั้งเป็น **Secret** เท่านั้น |
+
+## OCR รูปภาพแบบไม่มีค่าใช้จ่าย
+
+เมื่อพนักงานส่งรูปเข้าบอต Worker จะดึงรูปจาก LINE, ย่อเป็น JPEG ก่อน แล้วส่งไป OCR.space ด้วยภาษาไทย (`tha`). ข้อความ OCR และการ์ดออเดอร์ที่แก้ไขได้จะถูก push ไปหาแอดมิน; พนักงานได้รับเพียงข้อความยืนยันการรับรูป.
+
+- ใช้ Cloudflare Images Free เพื่อย่อรูปสูงสุด 3 ระดับก่อน OCR โดยไม่มีการเก็บรูปใน Worker. Free plan รองรับ image transformations ใหม่ได้สูงสุด 5,000 รายการ/เดือน; หากเกิน ระบบจะไม่แปลงรูปเพิ่มและ OCR ของรูปนั้นจะไม่ถูกส่งต่อ.
+- OCR.space Free รับไฟล์ได้ไม่เกิน **1 MB**. Worker จะตรวจขนาดของรูปที่ย่อแล้วก่อน upload; หากยังเกิน หรือ OCR ล้มเหลว จะแจ้งแอดมินให้ขอรูปใหม่หรือรายการข้อความแทน.
+- รูปถูกส่งไปยัง OCR.space เพื่อประมวลผล จึงไม่ควรใช้กับภาพที่มีข้อมูลส่วนบุคคลหรือข้อมูลการชำระเงินที่ไม่ควรส่งให้ผู้ให้บริการภายนอก.
+
+### ตั้งค่า
+
+1. สมัครและสร้าง API key แบบ Free ที่ OCR.space.
+2. ใน Cloudflare Dashboard ไปที่ **Workers & Pages → supplier-order → Settings → Variables and Secrets** แล้วเพิ่ม `OCR_SPACE_API_KEY` เป็น **Secret**.
+3. ที่ **Workers & Pages → supplier-order → Settings → Images** เปิดใช้ Image Transformations หากบัญชีแสดงปุ่มให้เปิดใช้.
+4. Deploy `worker.js` เวอร์ชันนี้ แล้วส่งภาพบิลทดสอบในแชตส่วนตัวกับบอต.
+
+ห้ามนำ key ไปวางใน JavaScript ฝั่งเว็บหรือ `wrangler.toml`.
 | `LIFF_BASE_URL` | `https://liff.line.me/<LIFF_ID>` (ไม่บังคับ) | ปกติไม่ต้องตั้ง เพราะระบบสร้างจาก `LIFF_ID` ให้เอง |
 
 **สำคัญ:** หลังแก้ Settings ทุกครั้ง ต้องเข้าไปที่แท็บ **Deployments** แล้วกด **Promote version** ที่เวอร์ชันล่าสุด ไม่งั้น Cloudflare จะยังใช้เวอร์ชันเก่าอยู่ (จุดที่ทำให้บอทไม่ตอบมาแล้วรอบนึง)
