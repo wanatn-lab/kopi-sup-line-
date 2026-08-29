@@ -28,6 +28,10 @@ const STORE_NAMES_LINE = ["ร้านโกปี๊ หลังโรงไ�
 const PENDING_TTL_SECONDS = 60 * 60 * 24 * 2; // 2 days — plenty for "approve later today/tomorrow"
 const OCR_SPACE_ENDPOINT = "https://api.ocr.space/parse/image";
 const OCR_SPACE_MAX_UPLOAD_BYTES = 1_000_000;
+const GEMINI_MODEL = "gemini-3.6-flash";
+const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent";
+const DEFAULT_GEMINI_DAILY_IMAGE_LIMIT = 10;
+const DEFAULT_GOOGLE_DRIVE_OCR_DAILY_LIMIT = 20;
 // OCR.space Free accepts images up to 1 MB. Cloudflare Images transformations
 // progressively lower the image dimensions/quality, while retaining a readable
 // full-page image for the Thai order list.
@@ -35,6 +39,13 @@ const OCR_RESIZE_PRESETS = [
   { width: 1600, height: 2200, quality: 65 },
   { width: 1280, height: 1800, quality: 55 },
   { width: 1024, height: 1440, quality: 45 }
+];
+// OCR.space's free endpoint can briefly return 502/503 under load. Retry only
+// transient failures, then fall back to its other engine before notifying staff.
+const OCR_ATTEMPTS = [
+  { engine: "2", delayMs: 0 },
+  { engine: "2", delayMs: 900 },
+  { engine: "1", delayMs: 1800 }
 ];
 
 function lnNormalize(s){
@@ -207,6 +218,118 @@ function truncateLineText(text, limit){
   return normalized.length > limit ? normalized.slice(0, limit - 20) + "\n… (ข้อความถูกตัดทอน)" : normalized;
 }
 
+function waitForOcrRetry(ms){
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getBangkokDay(){
+  // Thailand has no daylight-saving changes, so this stays stable at local midnight.
+  return new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function toBase64(bytes){
+  const data = new Uint8Array(bytes);
+  let binary = "";
+  for (let offset = 0; offset < data.length; offset += 0x8000) {
+    binary += String.fromCharCode(...data.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+
+async function reserveGeminiImageQuota(env){
+  const configured = Number.parseInt(env.GEMINI_DAILY_IMAGE_LIMIT || "", 10);
+  const limit = Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_GEMINI_DAILY_IMAGE_LIMIT;
+  const key = "gemini-ocr-quota:" + getBangkokDay();
+  const current = Number.parseInt(await env.KOPI_KV.get(key) || "0", 10) || 0;
+  if (current >= limit) {
+    throw new Error("โควต้า OCR วันนี้ครบ " + limit + " รูปแล้ว ระบบจะไม่อัปโหลดรูปเพิ่มเติม กรุณาพิมพ์รายการหรือรอพรุ่งนี้");
+  }
+  // KV is eventually consistent, but this blocks normal sequential submissions before any
+  // image bytes leave the Worker. Keep the counter briefly beyond the local date boundary.
+  await env.KOPI_KV.put(key, String(current + 1), { expirationTtl: 60 * 60 * 48 });
+  return { used: current + 1, limit };
+}
+
+async function reserveGoogleDriveOcrQuota(env){
+  const configured = Number.parseInt(env.GOOGLE_DRIVE_OCR_DAILY_LIMIT || "", 10);
+  const limit = Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_GOOGLE_DRIVE_OCR_DAILY_LIMIT;
+  const key = "google-drive-ocr-quota:" + getBangkokDay();
+  const current = Number.parseInt(await env.KOPI_KV.get(key) || "0", 10) || 0;
+  if (current >= limit) {
+    throw new Error("โควต้า Google Drive OCR วันนี้ครบ " + limit + " รูปแล้ว ระบบจะไม่อัปโหลดรูปเพิ่มเติม กรุณาพิมพ์รายการหรือรอพรุ่งนี้");
+  }
+  await env.KOPI_KV.put(key, String(current + 1), { expirationTtl: 60 * 60 * 48 });
+  return { used: current + 1, limit };
+}
+
+async function extractTextWithGoogleDrive(image, env){
+  const quota = await reserveGoogleDriveOcrQuota(env);
+  const initialResponse = await fetch(env.GOOGLE_DRIVE_OCR_WEB_APP_URL, {
+    method: "POST",
+    // Apps Script responds to POST with a 302 to script.googleusercontent.com.
+    // Follow it explicitly as GET; implicit redirect handling can retain POST and
+    // makes the Google content endpoint respond with an HTML 404/405 page.
+    redirect: "manual",
+    headers: {
+      "content-type": "application/json",
+      "x-ocr-secret": env.GOOGLE_DRIVE_OCR_SHARED_SECRET
+    },
+    body: JSON.stringify({
+      secret: env.GOOGLE_DRIVE_OCR_SHARED_SECRET,
+      imageBase64: toBase64(await image.arrayBuffer()),
+      mimeType: image.type || "image/jpeg"
+    })
+  });
+  const redirectLocation = initialResponse.headers.get("location");
+  const response = initialResponse.status >= 300 && initialResponse.status < 400 && redirectLocation
+    ? await fetch(redirectLocation, { method: "GET" })
+    : initialResponse;
+  let result;
+  try { result = await response.json(); } catch (_) { throw new Error("Google Drive OCR ตอบกลับข้อมูลไม่ถูกต้อง (HTTP " + response.status + ")"); }
+  if (!response.ok || !result || !result.ok) {
+    throw new Error((result && result.error) || "Google Drive OCR ตอบกลับ HTTP " + response.status);
+  }
+  const text = String(result.text || "").trim();
+  if (!text) throw new Error("Google Drive OCR ไม่พบข้อความในรูป");
+  return { text, quota };
+}
+
+async function extractTextWithGemini(image, env){
+  const quota = await reserveGeminiImageQuota(env);
+  const response = await fetch(GEMINI_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-goog-api-key": env.GEMINI_API_KEY
+    },
+    body: JSON.stringify({
+      contents: [{
+        role: "user",
+        parts: [
+          { text: "อ่านข้อความทั้งหมดจากภาพรายการสั่งของนี้ แล้วตอบเฉพาะข้อความที่เห็นในภาพตามลำดับบรรทัดเดิม ห้ามสรุป ห้ามเพิ่มคำอธิบาย และเก็บตัวเลขกับหน่วยให้ครบ" },
+          { inlineData: { mimeType: image.type || "image/jpeg", data: toBase64(await image.arrayBuffer()) } }
+        ]
+      }],
+      generationConfig: { temperature: 0, maxOutputTokens: 4096, responseMimeType: "text/plain" }
+    })
+  });
+
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const body = await response.json();
+      detail = body && body.error && body.error.message ? ": " + body.error.message : "";
+    } catch (_) { /* use HTTP status below */ }
+    throw new Error("Gemini ตอบกลับ HTTP " + response.status + detail);
+  }
+
+  const result = await response.json();
+  const parts = ((((result.candidates || [])[0] || {}).content || {}).parts || []);
+  const text = parts.map((part) => part && part.text || "").join("\n").trim();
+  if (!text) throw new Error("Gemini ไม่พบข้อความในรูป");
+  return { text, quota };
+}
+
 // LINE keeps original message content behind an authenticated URL. Image
 // transformations forward that authorization only inside this Worker, and the
 // transformed bytes are never exposed through a public endpoint.
@@ -243,32 +366,64 @@ async function fetchCompressedLineImage(messageId, accessToken){
 }
 
 async function extractTextFromLineImage(messageId, env){
-  if (!env.OCR_SPACE_API_KEY) throw new Error("ยังไม่ได้ตั้งค่า OCR_SPACE_API_KEY");
+  if (env.OCR_IMAGE_UPLOADS_ENABLED === "false") {
+    throw new Error("ระบบ OCR อยู่ระหว่างเปลี่ยนผู้ให้บริการ จึงยังไม่อัปโหลดรูป กรุณาพิมพ์รายการชั่วคราว");
+  }
   if (!env.LINE_CHANNEL_ACCESS_TOKEN) throw new Error("ยังไม่ได้ตั้งค่า LINE_CHANNEL_ACCESS_TOKEN");
 
   const image = await fetchCompressedLineImage(messageId, env.LINE_CHANNEL_ACCESS_TOKEN);
-  const form = new FormData();
-  form.append("file", image, "line-order.jpg");
-  form.append("language", "tha");
-  form.append("OCREngine", "2");
-  form.append("isOverlayRequired", "false");
-
-  const response = await fetch(OCR_SPACE_ENDPOINT, {
-    method: "POST",
-    headers: { "apikey": env.OCR_SPACE_API_KEY },
-    body: form
-  });
-  if (!response.ok) throw new Error("OCR.space ตอบกลับ HTTP " + response.status);
-
-  let result;
-  try { result = await response.json(); } catch (error) { throw new Error("OCR.space ตอบกลับข้อมูลไม่ถูกต้อง"); }
-  if (result.IsErroredOnProcessing) {
-    const detail = Array.isArray(result.ErrorMessage) ? result.ErrorMessage.join(" ") : result.ErrorMessage;
-    throw new Error(detail || "OCR.space อ่านรูปไม่สำเร็จ");
+  if (env.GOOGLE_DRIVE_OCR_WEB_APP_URL && env.GOOGLE_DRIVE_OCR_SHARED_SECRET) {
+    const googleDrive = await extractTextWithGoogleDrive(image, env);
+    return { text: googleDrive.text, imageBytes: image.size, provider: "google-drive", quota: googleDrive.quota };
   }
-  const text = (result.ParsedResults || []).map((entry) => entry && entry.ParsedText || "").join("\n").trim();
-  if (!text) throw new Error("ไม่พบข้อความในรูป");
-  return { text, imageBytes: image.size };
+  if (env.GEMINI_API_KEY) {
+    const gemini = await extractTextWithGemini(image, env);
+    return { text: gemini.text, imageBytes: image.size, provider: "gemini", quota: gemini.quota };
+  }
+
+  if (!env.OCR_SPACE_API_KEY) throw new Error("ยังไม่ได้ตั้งค่า GEMINI_API_KEY หรือ OCR_SPACE_API_KEY");
+  let lastTransientError = "";
+  for (const attempt of OCR_ATTEMPTS) {
+    if (attempt.delayMs) await waitForOcrRetry(attempt.delayMs);
+
+    const form = new FormData();
+    form.append("file", image, "line-order.jpg");
+    form.append("language", "tha");
+    form.append("OCREngine", attempt.engine);
+    form.append("isOverlayRequired", "false");
+
+    let response;
+    try {
+      response = await fetch(OCR_SPACE_ENDPOINT, {
+        method: "POST",
+        headers: { "apikey": env.OCR_SPACE_API_KEY },
+        body: form
+      });
+    } catch (error) {
+      lastTransientError = "OCR.space เชื่อมต่อไม่ได้ชั่วคราว";
+      continue;
+    }
+
+    if (!response.ok) {
+      const reason = "OCR.space ตอบกลับ HTTP " + response.status;
+      if (response.status === 429 || response.status >= 500) {
+        lastTransientError = reason;
+        continue;
+      }
+      throw new Error(reason);
+    }
+
+    let result;
+    try { result = await response.json(); } catch (error) { throw new Error("OCR.space ตอบกลับข้อมูลไม่ถูกต้อง"); }
+    if (result.IsErroredOnProcessing) {
+      const detail = Array.isArray(result.ErrorMessage) ? result.ErrorMessage.join(" ") : result.ErrorMessage;
+      throw new Error(detail || "OCR.space อ่านรูปไม่สำเร็จ");
+    }
+    const text = (result.ParsedResults || []).map((entry) => entry && entry.ParsedText || "").join("\n").trim();
+    if (!text) throw new Error("ไม่พบข้อความในรูป");
+    return { text, imageBytes: image.size, provider: "ocr-space" };
+  }
+  throw new Error(lastTransientError || "OCR.space ไม่พร้อมให้บริการชั่วคราว");
 }
 
 // The order controls must never be sent to the person who placed an order.
@@ -417,8 +572,42 @@ function buildUnmatchedBubble(unmatchedItems, pendingId, liffBaseUrl){
       contents: liffBaseUrl ? [
         { type: "button", style: "primary", color: "#b91c1c", height: "sm", action: { type: "uri", label: "✏️ แก้ไข", uri: liffBaseUrl + "?id=" + encodeURIComponent(pendingId) + "&unmatched=1" } },
         { type: "button", style: "secondary", height: "sm", action: { type: "postback", label: "🔄 สรุปใหม่", data: "back:" + pendingId, displayText: "ดูสรุปออเดอร์ล่าสุด" } }
-      ] : [{ type: "text", text: "ตั้งค่า LIFF ก่อนเพื่อแก้ไขรายการ", size: "xs", color: "#9ca3af", wrap: true }]
+      ] : [
+        { type: "button", style: "primary", color: "#b91c1c", height: "sm", action: { type: "postback", label: "✏️ จัดรายการ", data: "editunmatched:" + pendingId, displayText: "จัดการรายการที่ยังไม่จัดซัพ" } },
+        { type: "button", style: "secondary", height: "sm", action: { type: "postback", label: "🔄 สรุปใหม่", data: "back:" + pendingId, displayText: "ดูสรุปออเดอร์ล่าสุด" } }
+      ]
     }
+  };
+}
+
+// การ์ดแก้ไขรายการที่ยังไม่จัดซัพ: ใช้ปุ่มในแชทได้เลย แม้ยังไม่ได้ตั้งค่า LIFF
+function buildUnmatchedEditBubble(unmatchedItems, pendingId){
+  const allItems = unmatchedItems || [];
+  const visibleItems = allItems.slice(0, 8);
+  const itemBoxes = visibleItems.map((it, idx) => ({
+    type: "box", layout: "vertical", spacing: "xs", margin: idx === 0 ? "none" : "md",
+    contents: [
+      { type: "text", text: it.label || "(ไม่ทราบชื่อรายการ)", size: "sm", wrap: true, weight: "bold", color: "#7f1d1d" },
+      {
+        type: "box", layout: "horizontal", spacing: "sm", alignItems: "center",
+        contents: [
+          { type: "button", style: "secondary", height: "sm", flex: 1, action: { type: "postback", label: "➖", data: "unmatchedqty:" + pendingId + ":" + idx + ":-1", displayText: "ลดจำนวน " + (it.label || "รายการ") } },
+          { type: "text", text: (it.qty || "?") + " " + (it.unit || ""), size: "sm", align: "center", flex: 2, color: "#111827", gravity: "center" },
+          { type: "button", style: "secondary", height: "sm", flex: 1, action: { type: "postback", label: "➕", data: "unmatchedqty:" + pendingId + ":" + idx + ":1", displayText: "เพิ่มจำนวน " + (it.label || "รายการ") } },
+          { type: "button", style: "primary", color: "#b91c1c", height: "sm", flex: 2, action: { type: "postback", label: "เลือกซัพ", data: "unmatchedmove:" + pendingId + ":" + idx, displayText: "เลือกซัพให้ " + (it.label || "รายการ") } }
+        ]
+      },
+      { type: "button", style: "link", height: "sm", action: { type: "postback", label: "ลบรายการนี้", data: "unmatcheddelete:" + pendingId + ":" + idx, displayText: "ลบ " + (it.label || "รายการ") } }
+    ]
+  }));
+  if (allItems.length > visibleItems.length) {
+    itemBoxes.push({ type: "text", text: "แสดง 8 รายการแรก — จัดรายการด้านบนแล้วกดกลับเพื่อดูรายการถัดไป", size: "xs", color: "#9ca3af", wrap: true });
+  }
+  return {
+    type: "bubble", size: "mega",
+    header: { type: "box", layout: "vertical", backgroundColor: "#fef2f2", contents: [{ type: "text", text: "✏️ จัดรายการที่ยังไม่จัดซัพ", weight: "bold", size: "md", color: "#b91c1c", wrap: true }] },
+    body: { type: "box", layout: "vertical", spacing: "md", contents: itemBoxes.length ? itemBoxes : [{ type: "text", text: "จัดรายการครบแล้วครับ", size: "sm", color: "#16a34a" }] },
+    footer: { type: "box", layout: "vertical", contents: [{ type: "button", style: "secondary", height: "sm", action: { type: "postback", label: "🔙 กลับสรุป", data: "back:" + pendingId, displayText: "กลับไปหน้าสรุปออเดอร์" } }] }
   };
 }
 function buildOrderFlexMessage(bySupplier, supplierOrder, unmatched, pendingId, liffBaseUrl){
@@ -941,40 +1130,49 @@ export default {
             );
             if (!ackRes.ok) console.error("[line image acknowledgement failed]", ackRes.status, await ackRes.text());
 
-            try {
-              const ocr = await extractTextFromLineImage(event.message.id, env);
-              const senderIsAdmin = isAdminLineUser(env, senderId, activeAdminId);
-              const ocrTextRes = await linePush(
-                activeAdminId,
-                [{
-                  type: "text",
-                  text: truncateLineText("🖼️ ข้อความที่อ่านจากรูป — กรุณาตรวจแก้ก่อนส่งซัพพลายเออร์\n\n" + ocr.text, 4900)
-                }],
-                env.LINE_CHANNEL_ACCESS_TOKEN
-              );
-              if (!ocrTextRes.ok) console.error("[line OCR text push failed]", ocrTextRes.status, await ocrTextRes.text());
+            // LINE can cancel a webhook connection immediately after it receives
+            // its 200 response. OCR requires several network requests, so keep it
+            // alive independently of that connection after acknowledging the image.
+            ctx.waitUntil((async () => {
+              try {
+                const ocr = await extractTextFromLineImage(event.message.id, env);
+                const senderIsAdmin = isAdminLineUser(env, senderId, activeAdminId);
+                const ocrTextRes = await linePush(
+                  activeAdminId,
+                  [{
+                    type: "text",
+                    text: truncateLineText("🖼️ ข้อความที่อ่านจากรูป — กรุณาตรวจแก้ก่อนส่งซัพพลายเออร์\n\n" + ocr.text, 4900)
+                  }],
+                  env.LINE_CHANNEL_ACCESS_TOKEN
+                );
+                if (!ocrTextRes.ok) console.error("[line OCR text push failed]", ocrTextRes.status, await ocrTextRes.text());
 
-              const delivery = await saveAndSendParsedOrder(env, {
-                activeAdminId,
-                senderId,
-                rawText: ocr.text,
-                senderIsAdmin,
-                dict,
-                aliasTable,
-                liffBaseUrl,
-                source: "ocr-image"
-              });
-              console.log("[line OCR order card]", "imageBytes=", ocr.imageBytes, "pushStatus=", delivery.cardStatus, "notificationStatus=", delivery.notificationStatus);
-            } catch (error) {
-              const reason = (error && error.message) || String(error);
-              console.error("[line OCR failed]", reason);
-              const failureRes = await linePush(
-                activeAdminId,
-                [{ type: "text", text: "⚠️ อ่านรูปออเดอร์ไม่สำเร็จ: " + truncateLineText(reason, 800) + "\nกรุณาขอให้พนักงานส่งรูปใหม่หรือพิมพ์รายการ" }],
-                env.LINE_CHANNEL_ACCESS_TOKEN
-              );
-              if (!failureRes.ok) console.error("[line OCR failure push failed]", failureRes.status, await failureRes.text());
-            }
+                const delivery = await saveAndSendParsedOrder(env, {
+                  activeAdminId,
+                  senderId,
+                  rawText: ocr.text,
+                  senderIsAdmin,
+                  dict,
+                  aliasTable,
+                  liffBaseUrl,
+                  source: "ocr-image"
+                });
+                console.log("[line OCR order card]", "provider=", ocr.provider, "imageBytes=", ocr.imageBytes, "quota=", ocr.quota && (ocr.quota.used + "/" + ocr.quota.limit), "pushStatus=", delivery.cardStatus, "notificationStatus=", delivery.notificationStatus);
+              } catch (error) {
+                const reason = (error && error.message) || String(error);
+                console.error("[line OCR failed]", reason);
+                const quotaReached = reason.startsWith("โควต้า OCR") || reason.startsWith("โควต้า Google Drive OCR");
+                const failureText = quotaReached
+                  ? "⚠️ " + reason
+                  : "⚠️ อ่านรูปออเดอร์ไม่สำเร็จ: " + truncateLineText(reason, 800) + "\nกรุณาขอให้พนักงานส่งรูปใหม่หรือพิมพ์รายการ";
+                const failureRes = await linePush(
+                  activeAdminId,
+                  [{ type: "text", text: failureText }],
+                  env.LINE_CHANNEL_ACCESS_TOKEN
+                );
+                if (!failureRes.ok) console.error("[line OCR failure push failed]", failureRes.status, await failureRes.text());
+              }
+            })());
 
           } else if (event.type === "postback") {
             const data = event.postback && event.postback.data || "";
@@ -1018,6 +1216,104 @@ export default {
                 if (await env.KOPI_KV.get(key) === pendingId) await env.KOPI_KV.delete(key);
                 await pushLatestDraftCard(env, activeAdminId, pendingId, record, "ส่ง " + supplierName + " แล้ว");
               }
+
+            } else if (data.startsWith("editunmatched:")) {
+              // เปิดการ์ดจัดการรายการที่ยังไม่รู้ซัพ ผ่านปุ่มในแชท ไม่ต้องใช้ LIFF
+              const pendingId = data.slice("editunmatched:".length);
+              const record = await env.KOPI_KV.get("line_pending:" + pendingId, { type: "json" });
+              const editBubble = buildUnmatchedEditBubble(record && record.unmatched, pendingId);
+              const res = await lineReply(
+                event.replyToken,
+                [{ type: "flex", altText: "จัดการรายการที่ยังไม่จัดซัพ", contents: editBubble }],
+                env.LINE_CHANNEL_ACCESS_TOKEN
+              );
+              if (!res.ok) console.error("[line editunmatched reply failed]", res.status, await res.text());
+
+            } else if (data.startsWith("unmatchedqty:")) {
+              // ปรับจำนวนของรายการที่ยังไม่จัดซัพ แล้วคืนการ์ดแก้ไขเวอร์ชันล่าสุด
+              const parts = data.slice("unmatchedqty:".length).split(":");
+              const pendingId = parts[0];
+              const itemIdx = parseInt(parts[1], 10);
+              const delta = parseFloat(parts[2]);
+              const record = await env.KOPI_KV.get("line_pending:" + pendingId, { type: "json" });
+              if (record && Array.isArray(record.unmatched) && record.unmatched[itemIdx]) {
+                const item = record.unmatched[itemIdx];
+                const current = parseFloat(item.qty) || 0;
+                const next = Math.max(0, current + delta);
+                item.qty = (Number.isInteger(next) ? next : Math.round(next * 100) / 100).toString();
+                await env.KOPI_KV.put("line_pending:" + pendingId, JSON.stringify(record), { expirationTtl: PENDING_TTL_SECONDS });
+              }
+              const editBubble = buildUnmatchedEditBubble(record && record.unmatched, pendingId);
+              const res = await lineReply(
+                event.replyToken,
+                [{ type: "flex", altText: "จัดการรายการที่ยังไม่จัดซัพ", contents: editBubble }],
+                env.LINE_CHANNEL_ACCESS_TOKEN
+              );
+              if (!res.ok) console.error("[line unmatchedqty reply failed]", res.status, await res.text());
+
+            } else if (data.startsWith("unmatchedmove:")) {
+              // เลือกซัพพลายเออร์ให้รายการที่ยังไม่จัดกลุ่ม ด้วย quick reply
+              const parts = data.slice("unmatchedmove:".length).split(":");
+              const pendingId = parts[0];
+              const itemIdx = parts[1];
+              const knownSuppliers = getKnownSuppliers(dict).slice(0, 12);
+              const quickItems = knownSuppliers.map(s => ({
+                type: "action",
+                action: {
+                  type: "postback",
+                  label: s.slice(0, 20),
+                  data: "unmatchedto:" + pendingId + ":" + itemIdx + ":" + encodeURIComponent(s),
+                  displayText: "ย้ายไป " + s
+                }
+              }));
+              const reply = quickItems.length
+                ? { type: "text", text: "เลือกซัพพลายเออร์สำหรับรายการนี้ครับ", quickReply: { items: quickItems } }
+                : { type: "text", text: "ยังไม่มีรายชื่อซัพพลายเออร์ให้เลือกครับ" };
+              const res = await lineReply(event.replyToken, [reply], env.LINE_CHANNEL_ACCESS_TOKEN);
+              if (!res.ok) console.error("[line unmatchedmove reply failed]", res.status, await res.text());
+
+            } else if (data.startsWith("unmatchedto:")) {
+              // ย้ายรายการที่ยังไม่จัดซัพเข้าไปยังซัพที่แอดมินเลือก แล้วเปิดสรุปที่อัปเดตแล้ว
+              const parts = data.slice("unmatchedto:".length).split(":");
+              const pendingId = parts[0];
+              const itemIdx = parseInt(parts[1], 10);
+              const destSupplier = decodeURIComponent(parts[2]);
+              const record = await env.KOPI_KV.get("line_pending:" + pendingId, { type: "json" });
+              if (record && Array.isArray(record.unmatched) && record.unmatched[itemIdx] && destSupplier) {
+                const moved = record.unmatched.splice(itemIdx, 1)[0];
+                if (!record.bySupplier) record.bySupplier = {};
+                if (!record.bySupplier[destSupplier]) record.bySupplier[destSupplier] = [];
+                record.bySupplier[destSupplier].push(moved);
+                if (!Array.isArray(record.supplierOrder)) record.supplierOrder = Object.keys(record.bySupplier);
+                if (!record.supplierOrder.includes(destSupplier)) record.supplierOrder.push(destSupplier);
+                // หากซัพนี้เคยถูกส่งแล้ว รายการที่เพิ่งย้ายต้องเปิดการ์ดใหม่ให้ส่งได้
+                if (record.sentSuppliers && record.sentSuppliers[destSupplier]) delete record.sentSuppliers[destSupplier];
+                await env.KOPI_KV.put("line_pending:" + pendingId, JSON.stringify(record), { expirationTtl: PENDING_TTL_SECONDS });
+              }
+              const updated = await env.KOPI_KV.get("line_pending:" + pendingId, { type: "json" });
+              const flexMessage = updated
+                ? buildOpenOrderFlexMessage(updated, pendingId, liffBaseUrl)
+                : { type: "text", text: "ไม่พบออเดอร์นี้แล้ว (อาจหมดอายุ)" };
+              const res = await lineReply(event.replyToken, [flexMessage], env.LINE_CHANNEL_ACCESS_TOKEN);
+              if (!res.ok) console.error("[line unmatchedto reply failed]", res.status, await res.text());
+
+            } else if (data.startsWith("unmatcheddelete:")) {
+              // ลบรายการที่อ่านผิดหรือไม่ต้องการ แล้วคืนหน้าจัดการล่าสุด
+              const parts = data.slice("unmatcheddelete:".length).split(":");
+              const pendingId = parts[0];
+              const itemIdx = parseInt(parts[1], 10);
+              const record = await env.KOPI_KV.get("line_pending:" + pendingId, { type: "json" });
+              if (record && Array.isArray(record.unmatched) && record.unmatched[itemIdx]) {
+                record.unmatched.splice(itemIdx, 1);
+                await env.KOPI_KV.put("line_pending:" + pendingId, JSON.stringify(record), { expirationTtl: PENDING_TTL_SECONDS });
+              }
+              const editBubble = buildUnmatchedEditBubble(record && record.unmatched, pendingId);
+              const res = await lineReply(
+                event.replyToken,
+                [{ type: "flex", altText: "จัดการรายการที่ยังไม่จัดซัพ", contents: editBubble }],
+                env.LINE_CHANNEL_ACCESS_TOKEN
+              );
+              if (!res.ok) console.error("[line unmatcheddelete reply failed]", res.status, await res.text());
 
             } else if (data.startsWith("editsup:")) {
               // เปิดการ์ดแก้ไขจำนวน/ย้ายซัพของซัพพลายเออร์นี้ (ในแชทเลย ไม่ต้องเปิดหน้าเว็บ)
