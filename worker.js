@@ -654,8 +654,9 @@ function buildUnmatchedEditBubble(unmatchedItems, pendingId){
     footer: { type: "box", layout: "vertical", contents: [{ type: "button", style: "secondary", height: "sm", action: { type: "postback", label: "🔙 กลับสรุป", data: "back:" + pendingId, displayText: "กลับไปหน้าสรุปออเดอร์" } }] }
   };
 }
-function buildOrderFlexMessage(bySupplier, supplierOrder, unmatched, pendingId, liffBaseUrl){
-  const bubbles = supplierOrder.map(sup => buildSupplierBubble(sup, bySupplier[sup], pendingId, liffBaseUrl));
+function buildOrderFlexMessage(bySupplier, supplierOrder, unmatched, pendingId, liffBaseUrl, statusBubble){
+  const bubbles = statusBubble ? [statusBubble] : [];
+  bubbles.push(...supplierOrder.map(sup => buildSupplierBubble(sup, bySupplier[sup], pendingId, liffBaseUrl)));
   if (unmatched && unmatched.length) bubbles.push(buildUnmatchedBubble(unmatched, pendingId, liffBaseUrl));
   if (bubbles.length === 0){
     return { type: "text", text: "ไม่พบรายการสินค้าที่อ่านออกได้เลยครับ ลองพิมพ์ใหม่ เช่น \"น้ำมันพืช 2 ขวด\"" };
@@ -664,6 +665,56 @@ function buildOrderFlexMessage(bySupplier, supplierOrder, unmatched, pendingId, 
     type: "flex",
     altText: "สรุปออเดอร์แยกซัพพลายเออร์ " + supplierOrder.length + " ราย" + (unmatched.length ? " (มีรายการที่จัดกลุ่มไม่ได้ " + unmatched.length + " รายการ)" : ""),
     contents: { type: "carousel", contents: bubbles }
+  };
+}
+
+// Once an order has started being sent, show one non-actionable status card at
+// the start of every refreshed summary. The original supplier card still
+// disappears after sending, so the admin cannot accidentally send it twice.
+function buildSentStatusSummaryBubble(record){
+  const sentSuppliers = record && record.sentSuppliers || {};
+  const supplierOrder = record && (record.supplierOrder || Object.keys(record.bySupplier || {})) || [];
+  const seen = new Set();
+  const suppliers = supplierOrder.concat(Object.keys(record && record.bySupplier || {}))
+    .filter((supplier) => {
+      if (!supplier || seen.has(supplier)) return false;
+      seen.add(supplier);
+      return Array.isArray(record && record.bySupplier && record.bySupplier[supplier]) && record.bySupplier[supplier].length;
+    });
+  const sent = suppliers.filter((supplier) => sentSuppliers[supplier]);
+  if (!sent.length) return null;
+
+  // Put completed suppliers first so the confirmation is never hidden when an
+  // order contains more suppliers than can fit comfortably in a Flex bubble.
+  const rows = sent.concat(suppliers.filter((supplier) => !sentSuppliers[supplier]))
+    .slice(0, 12)
+    .map((supplier) => ({
+      type: "box", layout: "horizontal", spacing: "sm",
+      contents: [
+        { type: "text", text: supplier, size: "sm", flex: 4, wrap: true, color: "#1f2937" },
+        {
+          type: "text",
+          text: sentSuppliers[supplier] ? "✅ ส่งแล้ว" : "⏳ รอส่ง",
+          size: "sm", flex: 2, align: "end",
+          color: sentSuppliers[supplier] ? "#15803d" : "#b45309",
+          weight: "bold"
+        }
+      ]
+    }));
+  if (suppliers.length > rows.length) {
+    rows.push({ type: "text", text: "… อีก " + (suppliers.length - rows.length) + " หมวด", size: "xs", color: "#6b7280", wrap: true });
+  }
+  return {
+    type: "bubble", size: "kilo",
+    header: {
+      type: "box", layout: "vertical", backgroundColor: "#eff6ff",
+      contents: [{ type: "text", text: "📋 สรุปสถานะออเดอร์", weight: "bold", size: "md", color: "#1d4ed8" }]
+    },
+    body: { type: "box", layout: "vertical", spacing: "sm", contents: rows },
+    footer: {
+      type: "box", layout: "vertical",
+      contents: [{ type: "text", text: "หมวดที่ส่งแล้วจะไม่แสดงปุ่มส่งซ้ำ", size: "xs", color: "#6b7280", wrap: true, align: "center" }]
+    }
   };
 }
 
@@ -681,7 +732,14 @@ function getOpenSupplierOrder(record){
 function buildOpenOrderFlexMessage(record, pendingId, liffBaseUrl){
   const supplierOrder = getOpenSupplierOrder(record);
   const unmatched = Array.isArray(record && record.unmatched) ? record.unmatched : [];
-  return buildOrderFlexMessage(record && record.bySupplier || {}, supplierOrder, unmatched, pendingId, liffBaseUrl);
+  return buildOrderFlexMessage(
+    record && record.bySupplier || {},
+    supplierOrder,
+    unmatched,
+    pendingId,
+    liffBaseUrl,
+    buildSentStatusSummaryBubble(record)
+  );
 }
 
 function buildAdminDraftFlexMessage(bubbles){
