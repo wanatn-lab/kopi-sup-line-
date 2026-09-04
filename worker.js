@@ -851,6 +851,105 @@ function formatSupplierPlainText(supplierName, items){
   return text.trim();
 }
 
+function staffQueuePointerKey(adminId){
+  return "line_staff_queue_current:" + encodeURIComponent(adminId);
+}
+
+function staffQueueRecordKey(queueId){
+  return "line_staff_queue:" + queueId;
+}
+
+function buildStaffQueueFlexMessage(queue, queueId){
+  const entries = Array.isArray(queue && queue.entries) ? queue.entries : [];
+  const people = new Set(entries.map((entry) => entry.senderId).filter(Boolean)).size;
+  const preview = entries.slice(0, 4).map((entry, index) => ({
+    type: "text",
+    text: (index + 1) + ". " + truncateLineText(String(entry.rawText || "").replace(/\r?\n+/g, " · "), 120),
+    size: "xs",
+    wrap: true,
+    color: "#4b5563"
+  }));
+  return {
+    type: "flex",
+    altText: "รายการจากทีมรอคัดแยก " + entries.length + " รายการ",
+    contents: {
+      type: "bubble",
+      size: "kilo",
+      header: {
+        type: "box", layout: "vertical", backgroundColor: "#eff6ff",
+        contents: [{ type: "text", text: "📥 รายการจากทีม — รอคัดแยก", weight: "bold", size: "md", color: "#1d4ed8", wrap: true }]
+      },
+      body: {
+        type: "box", layout: "vertical", spacing: "sm",
+        contents: [
+          { type: "text", text: "สะสมแล้ว " + entries.length + " ข้อความ" + (people ? " จาก " + people + " คน" : ""), size: "sm", weight: "bold", color: "#1f2937" },
+          { type: "text", text: "รายการใหม่จากทีมจะรวมเข้ากล่องนี้ต่อไป จนกดคัดแยก", size: "xs", color: "#6b7280", wrap: true },
+          ...preview,
+          ...(entries.length > preview.length ? [{ type: "text", text: "… และอีก " + (entries.length - preview.length) + " ข้อความ", size: "xs", color: "#6b7280" }] : [])
+        ]
+      },
+      footer: {
+        type: "box", layout: "vertical",
+        contents: [{
+          type: "button", style: "primary", color: "#2563eb", height: "sm",
+          action: { type: "postback", label: "🤖 คัดแยกตอนนี้", data: "splitqueue:" + queueId, displayText: "คัดแยกรายการที่รออยู่" }
+        }]
+      }
+    }
+  };
+}
+
+// All staff submissions share one pending inbox. LINE messages cannot be
+// edited in place, so we send one trigger card only when the inbox is created;
+// later submissions update the saved inbox silently until the admin presses it.
+async function enqueueStaffOrder(env, adminId, rawText, senderId, source){
+  const pointerKey = staffQueuePointerKey(adminId);
+  let queueId = await env.KOPI_KV.get(pointerKey);
+  let queue = queueId ? await env.KOPI_KV.get(staffQueueRecordKey(queueId), { type: "json" }) : null;
+  let created = false;
+  if (!queue || queue.adminId !== adminId || !Array.isArray(queue.entries)){
+    queueId = lnGenId("q");
+    queue = { adminId, createdAt: Date.now(), entries: [], cardDelivered: false };
+    created = true;
+  }
+  queue.entries.push({ rawText: String(rawText || "").trim(), senderId: senderId || null, source: source || "text", receivedAt: Date.now() });
+  queue.updatedAt = Date.now();
+  await env.KOPI_KV.put(staffQueueRecordKey(queueId), JSON.stringify(queue), { expirationTtl: PENDING_TTL_SECONDS });
+  await env.KOPI_KV.put(pointerKey, queueId, { expirationTtl: PENDING_TTL_SECONDS });
+  return { queueId, queue, created, shouldNotify: !queue.cardDelivered };
+}
+
+// A text alert is deliberately sent separately from the Flex card. If LINE
+// rejects a card for any reason, the admin still knows a queue is waiting and
+// the next staff submission will retry the card automatically.
+async function pushStaffQueueCard(env, adminId, queued){
+  if (!queued || !queued.shouldNotify) return { notified: false };
+  const alert = await linePush(
+    adminId,
+    [{ type: "text", text: "📥 มีรายการจากทีมรอคัดแยก " + queued.queue.entries.length + " ข้อความ — การ์ดคัดแยกกำลังส่งตามมา" }],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+  if (!alert.ok) {
+    console.error("[line staff queue alert failed]", alert.status, await alert.text());
+    return { notified: false };
+  }
+  const card = await linePush(
+    adminId,
+    [buildStaffQueueFlexMessage(queued.queue, queued.queueId)],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+  if (!card.ok) {
+    console.error("[line staff queue card failed]", card.status, await card.text());
+    return { notified: true, cardDelivered: false };
+  }
+  const current = await env.KOPI_KV.get(staffQueueRecordKey(queued.queueId), { type: "json" });
+  if (current && Array.isArray(current.entries)) {
+    current.cardDelivered = true;
+    await env.KOPI_KV.put(staffQueueRecordKey(queued.queueId), JSON.stringify(current), { expirationTtl: PENDING_TTL_SECONDS });
+  }
+  return { notified: true, cardDelivered: true };
+}
+
 // The text notification and the interactive Flex card are deliberately separate
 // pushes. If a card becomes invalid, the admin still receives the parsed order.
 async function saveAndSendParsedOrder(env, options){
@@ -898,11 +997,26 @@ async function getVerifiedLiffOwnerId(request, env){
     return { error: new Response("LIFF admin settings are incomplete", { status: 503 }) };
   }
   try {
-    const response = await fetch("https://api.line.me/oauth2/v2.1/verify", {
+    const verify = (clientId) => fetch("https://api.line.me/oauth2/v2.1/verify", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ id_token: idToken, client_id: env.LIFF_CHANNEL_ID }).toString()
+      body: new URLSearchParams({ id_token: idToken, client_id: clientId }).toString()
     });
+    let response = await verify(env.LIFF_CHANNEL_ID);
+    // A LIFF app can belong to a different LINE channel than the Messaging API
+    // channel. LINE still signs the ID token; retry only with its declared
+    // audience, then retain the strict subject-to-active-admin authorization.
+    if (!response.ok) {
+      let tokenAudience = "";
+      try {
+        const payload = idToken.split(".")[1];
+        const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+        tokenAudience = JSON.parse(atob(normalized)).aud || "";
+      } catch (error) {}
+      if (typeof tokenAudience === "string" && tokenAudience && tokenAudience !== env.LIFF_CHANNEL_ID) {
+        response = await verify(tokenAudience);
+      }
+    }
     if (!response.ok) return { error: new Response("Invalid LIFF login", { status: 401 }) };
     const profile = await response.json();
     if (!isAdminLineUser(env, profile.sub, activeAdminId)) {
@@ -1183,16 +1297,20 @@ export default {
       let payload;
       try { payload = JSON.parse(rawBody); } catch (e) { return new Response("Bad JSON", { status: 400 }); }
       const events = payload.events || [];
-      const state = (await env.KOPI_KV.get(STATE_KEY, { type: "json" })) || {};
-      const dict = Array.isArray(state.dict) ? state.dict : [];
-      const aliasTable = Array.isArray(state.alias) ? state.alias : [];
-      // LIFF_BASE_URL, if supplied, must be a LIFF launch URL
-      // (https://liff.line.me/<liff-id>), not the Worker endpoint URL.
-      const liffBaseUrl = env.LIFF_ID
-        ? (env.LIFF_BASE_URL || ("https://liff.line.me/" + env.LIFF_ID))
-        : "";
+      // LINE can close the webhook connection as soon as it gets a 200 response.
+      // Keep every KV write and outbound LINE call alive independently; otherwise
+      // a staff acknowledgement may succeed while the admin card is canceled.
+      ctx.waitUntil((async () => {
+        const state = (await env.KOPI_KV.get(STATE_KEY, { type: "json" })) || {};
+        const dict = Array.isArray(state.dict) ? state.dict : [];
+        const aliasTable = Array.isArray(state.alias) ? state.alias : [];
+        // LIFF_BASE_URL, if supplied, must be a LIFF launch URL
+        // (https://liff.line.me/<liff-id>), not the Worker endpoint URL.
+        const liffBaseUrl = env.LIFF_ID
+          ? (env.LIFF_BASE_URL || ("https://liff.line.me/" + env.LIFF_ID))
+          : "";
 
-      for (const event of events) {
+        for (const event of events) {
         try {
           if (event.type === "message" && event.message && event.message.type === "text") {
             const senderId = (event.source || {}).userId || null;
@@ -1245,6 +1363,25 @@ export default {
                 env.LINE_CHANNEL_ACCESS_TOKEN
               );
               if (!configReply.ok) console.error("[line admin-config reply failed]", configReply.status, await configReply.text());
+              continue;
+            }
+
+            // Recovery path for the single staff inbox. The first notification is
+            // a push message, so the admin can explicitly ask for the latest card
+            // again if LINE was temporarily unable to display it.
+            const isQueueCommand = /^#\s*(คิวรอ|ดูคิว|รายการรอ)\s*$/.test(setupText);
+            if (isQueueCommand && isAdminLineUser(env, senderId, activeAdminId)) {
+              const queueId = await env.KOPI_KV.get(staffQueuePointerKey(activeAdminId));
+              const queue = queueId ? await env.KOPI_KV.get(staffQueueRecordKey(queueId), { type: "json" }) : null;
+              if (!queue || !Array.isArray(queue.entries) || !queue.entries.length) {
+                const emptyReply = await lineReply(event.replyToken, [{ type: "text", text: "ยังไม่มีรายการจากทีมที่รอคัดแยกครับ" }], env.LINE_CHANNEL_ACCESS_TOKEN);
+                if (!emptyReply.ok) console.error("[line queue recovery empty reply failed]", emptyReply.status, await emptyReply.text());
+              } else {
+                const reply = await lineReply(event.replyToken, [{ type: "text", text: "กำลังส่งการ์ดคิวล่าสุดให้ครับ" }], env.LINE_CHANNEL_ACCESS_TOKEN);
+                if (!reply.ok) console.error("[line queue recovery reply failed]", reply.status, await reply.text());
+                const delivered = await pushStaffQueueCard(env, activeAdminId, { queueId, queue, shouldNotify: true });
+                console.log("[line queue recovery]", "queue=", queueId, "entries=", queue.entries.length, "notified=", delivered.notified, "cardDelivered=", delivered.cardDelivered);
+              }
               continue;
             }
 
@@ -1313,11 +1450,12 @@ export default {
               continue;
             }
 
-            // Confirm receipt before parsing or saving the order. A malformed item
-            // must never leave the staff member wondering whether LINE received it.
+            const senderIsAdmin = isAdminLineUser(env, senderId, activeAdminId);
+            // Confirm receipt before processing. Staff submissions intentionally
+            // wait in the shared inbox until the admin asks the bot to classify.
             const ackRes = await lineReply(
               event.replyToken,
-              [{ type: "text", text: "รับรายการแล้วครับ ✅ กำลังส่งให้แอดมินตรวจสอบ" }],
+              [{ type: "text", text: senderIsAdmin ? "รับรายการแล้วครับ ✅ กำลังแยกให้แอดมินตรวจสอบ" : "รับรายการแล้วครับ ✅ รอแอดมินกดคัดแยก" }],
               env.LINE_CHANNEL_ACCESS_TOKEN
             );
             console.log("[line order acknowledgement]", "status=", ackRes.status);
@@ -1325,7 +1463,13 @@ export default {
               console.error("[line order acknowledgement failed]", ackRes.status, await ackRes.text());
             }
 
-            const senderIsAdmin = isAdminLineUser(env, senderId, activeAdminId);
+            if (!senderIsAdmin) {
+              const queued = await enqueueStaffOrder(env, activeAdminId, event.message.text, senderId, "text");
+              const queueDelivery = await pushStaffQueueCard(env, activeAdminId, queued);
+              console.log("[line staff order queued]", "queue=", queued.queueId, "entries=", queued.queue.entries.length, "ackStatus=", ackRes.status, "notified=", queueDelivery.notified, "cardDelivered=", queueDelivery.cardDelivered);
+              continue;
+            }
+
             const delivery = await saveAndSendParsedOrder(env, {
               activeAdminId,
               senderId,
@@ -1351,9 +1495,10 @@ export default {
               continue;
             }
 
+            const senderIsAdmin = isAdminLineUser(env, senderId, activeAdminId);
             const ackRes = await lineReply(
               event.replyToken,
-              [{ type: "text", text: "รับรูปแล้วครับ ✅ กำลังอ่านรายการและส่งให้แอดมินตรวจสอบ" }],
+              [{ type: "text", text: senderIsAdmin ? "รับรูปแล้วครับ ✅ กำลังอ่านและแยกรายการ" : "รับรูปแล้วครับ ✅ กำลังอ่านรายการ รอแอดมินกดคัดแยก" }],
               env.LINE_CHANNEL_ACCESS_TOKEN
             );
             if (!ackRes.ok) console.error("[line image acknowledgement failed]", ackRes.status, await ackRes.text());
@@ -1364,7 +1509,12 @@ export default {
             ctx.waitUntil((async () => {
               try {
                 const ocr = await extractTextFromLineImage(event.message.id, env);
-                const senderIsAdmin = isAdminLineUser(env, senderId, activeAdminId);
+                if (!senderIsAdmin) {
+                  const queued = await enqueueStaffOrder(env, activeAdminId, ocr.text, senderId, "ocr-image");
+                  const queueDelivery = await pushStaffQueueCard(env, activeAdminId, queued);
+                  console.log("[line OCR queued]", "provider=", ocr.provider, "queue=", queued.queueId, "entries=", queued.queue.entries.length, "notified=", queueDelivery.notified, "cardDelivered=", queueDelivery.cardDelivered);
+                  return;
+                }
                 const ocrTextRes = await linePush(
                   activeAdminId,
                   [{
@@ -1419,7 +1569,49 @@ export default {
               continue;
             }
 
-            if (data.startsWith("send:")) {
+            if (data.startsWith("splitqueue:")) {
+              const queueId = data.slice("splitqueue:".length);
+              const pointerKey = staffQueuePointerKey(activeAdminId);
+              const currentQueueId = await env.KOPI_KV.get(pointerKey);
+              const queue = await env.KOPI_KV.get(staffQueueRecordKey(queueId), { type: "json" });
+              if (!queue || queue.adminId !== activeAdminId || !Array.isArray(queue.entries) || !queue.entries.length || currentQueueId !== queueId) {
+                const res = await lineReply(event.replyToken, [{ type: "text", text: "การ์ดรอคัดแยกนี้หมดอายุแล้ว หรือถูกคัดแยกไปแล้วครับ" }], env.LINE_CHANNEL_ACCESS_TOKEN);
+                if (!res.ok) console.error("[line splitqueue stale reply failed]", res.status, await res.text());
+                continue;
+              }
+              // Clear the active pointer first. Orders arriving after this moment
+              // start a fresh waiting card instead of being mixed into this batch.
+              await env.KOPI_KV.delete(pointerKey);
+              const rawText = queue.entries.map((entry) => entry.rawText || "").filter(Boolean).join("\n");
+              const startingRes = await lineReply(
+                event.replyToken,
+                [{ type: "text", text: "🤖 กำลังคัดแยก " + queue.entries.length + " ข้อความจากทีมครับ" }],
+                env.LINE_CHANNEL_ACCESS_TOKEN
+              );
+              if (!startingRes.ok) console.error("[line splitqueue start reply failed]", startingRes.status, await startingRes.text());
+              try {
+                const delivery = await saveAndSendParsedOrder(env, {
+                  activeAdminId,
+                  senderId: null,
+                  rawText,
+                  senderIsAdmin: false,
+                  dict,
+                  aliasTable,
+                  liffBaseUrl,
+                  source: "staff-queue"
+                });
+                await env.KOPI_KV.delete(staffQueueRecordKey(queueId));
+                console.log("[line splitqueue complete]", "queue=", queueId, "entries=", queue.entries.length, "pending=", delivery.pendingId);
+              } catch (error) {
+                // Restore the pointer so the batch is never lost if downstream
+                // classification or LINE delivery unexpectedly fails.
+                await env.KOPI_KV.put(pointerKey, queueId, { expirationTtl: PENDING_TTL_SECONDS });
+                console.error("[line splitqueue failed]", (error && error.stack) || String(error));
+                const failed = await linePush(activeAdminId, [{ type: "text", text: "⚠️ คัดแยกยังไม่สำเร็จ รายการยังรออยู่ กดคัดแยกอีกครั้งได้ครับ" }], env.LINE_CHANNEL_ACCESS_TOKEN);
+                if (!failed.ok) console.error("[line splitqueue failure push failed]", failed.status, await failed.text());
+              }
+
+            } else if (data.startsWith("send:")) {
               const rest = data.slice("send:".length);
               const sepIdx = rest.indexOf(":");
               const pendingId = rest.slice(0, sepIdx);
@@ -1681,7 +1873,8 @@ export default {
           // One bad event shouldn't 500 the whole webhook batch — LINE retries on non-200.
           console.log("[webhook event error]", (e && (e.stack || e.message)) || String(e));
         }
-      }
+        }
+      })());
       return new Response("OK", { status: 200 });
     }
 
