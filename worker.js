@@ -18,6 +18,7 @@ const ACTIVE_ADMIN_KEY = "line_active_admin_user_id";
 // so the shop PC and any phone see the same orders and "ดูข้อมูลเมื่อวาน" can look back
 // further than a single localStorage snapshot.
 const ORDER_KEY_PREFIX = "kopi_orders_";
+const ORDER_RESET_SNAPSHOT_PREFIX = "kopi_order_reset_snapshot_";
 const ORDER_RETENTION_DAYS = 7;
 
 
@@ -316,10 +317,12 @@ async function cleanupOldOrderKeys(env){
   const cutoff = new Date(todayStr + "T00:00:00Z");
   cutoff.setUTCDate(cutoff.getUTCDate() - ORDER_RETENTION_DAYS);
   const cutoffStr = cutoff.toISOString().slice(0, 10);
-  const list = await env.KOPI_KV.list({ prefix: ORDER_KEY_PREFIX });
-  for (const key of list.keys) {
-    const dateStr = key.name.slice(ORDER_KEY_PREFIX.length);
-    if (dateStr && dateStr < cutoffStr) await env.KOPI_KV.delete(key.name);
+  for (const prefix of [ORDER_KEY_PREFIX, ORDER_RESET_SNAPSHOT_PREFIX]) {
+    const list = await env.KOPI_KV.list({ prefix });
+    for (const key of list.keys) {
+      const dateStr = key.name.slice(prefix.length);
+      if (dateStr && dateStr < cutoffStr) await env.KOPI_KV.delete(key.name);
+    }
   }
 }
 
@@ -884,11 +887,88 @@ const RESPONSIVE_UI = String.raw`<style>
 })();
 </script>`;
 
+// Keeps one recoverable copy of the latest non-empty order list before the daily reset
+// overwrites today's live KV record. This script runs after the page's original handlers,
+// so it intercepts reset clicks and guarantees the snapshot is written first.
+const RESET_SNAPSHOT_UI = String.raw`<script>
+(()=>{
+  const snapshotUrl=()=>"/api/orders?date="+encodeURIComponent(todayDateStr())+"&snapshot=reset";
+  const resetButton=document.getElementById("dailyResetBtn");
+  const confirmButton=document.getElementById("resetModalConfirm");
+  const cancelButton=document.getElementById("resetModalCancel");
+  const modal=document.getElementById("resetModalOverlay");
+  const title=modal&&modal.querySelector(".modal-box h3");
+  if(!resetButton||!confirmButton||!cancelButton||!modal||!title)return;
+
+  const previewButton=document.createElement("button");
+  previewButton.className="small secondary";
+  previewButton.textContent="↩️ ดูก่อนล้าง";
+  previewButton.style.display="none";
+  resetButton.parentNode.insertBefore(previewButton,resetButton);
+
+  async function readSnapshot(){
+    const response=await fetch(snapshotUrl());
+    if(!response.ok)throw new Error("โหลดข้อมูลก่อนล้างไม่สำเร็จ");
+    const orders=await response.json();
+    return Array.isArray(orders)?orders:[];
+  }
+  async function updatePreviewButton(){
+    try{previewButton.style.display=(await readSnapshot()).length?"inline-block":"none"}catch(error){previewButton.style.display="none"}
+  }
+  function prepareResetModal(){
+    title.textContent="ยืนยันการล้างข้อมูลรายวัน";
+    confirmButton.style.display="inline-block";
+    cancelButton.textContent="ยกเลิก";
+    document.getElementById("resetModalSummary").innerHTML=resetModalSummaryHTML();
+  }
+  function previewHtml(orders){
+    return orders.map(order=>{
+      const items=(order.items||[]).map(item=>'&nbsp;&nbsp;- '+escapeAttr(item.label)+(item.qty!=="?"?' '+item.qty:'')+(item.unit?' '+escapeAttr(item.unit):'')+(item.supplier?' ('+escapeAttr(item.supplier)+')':' (ยังไม่แมท)')).join("<br>");
+      return '<p style="margin:8px 0 2px;"><b>'+escapeAttr(order.orderer||order.department||"ออเดอร์")+'</b> <span class="muted">'+escapeAttr(order.department||"")+'</span></p><p style="margin:0;font-size:12.5px;">'+items+'</p>';
+    }).join("");
+  }
+
+  resetButton.addEventListener("click",event=>{event.stopImmediatePropagation();prepareResetModal();openResetModal()},true);
+  confirmButton.addEventListener("click",async event=>{
+    event.stopImmediatePropagation();
+    if(!ORDERS.length){closeResetModal();showToast("ยังไม่มีออเดอร์ให้ล้าง");return}
+    confirmButton.disabled=true;
+    confirmButton.textContent="กำลังบันทึกก่อนล้าง...";
+    try{
+      const snapshotResponse=await fetch(snapshotUrl(),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(ORDERS)});
+      if(!snapshotResponse.ok)throw new Error("บันทึกข้อมูลก่อนล้างไม่สำเร็จ");
+      const clearResponse=await fetch("/api/orders?date="+encodeURIComponent(todayDateStr()),{method:"POST",headers:{"Content-Type":"application/json"},body:"[]"});
+      if(!clearResponse.ok)throw new Error("ล้างข้อมูลไม่สำเร็จ");
+      ORDERS=[];
+      renderOrders();renderDispatch();closeResetModal();await updatePreviewButton();
+      showToast("ล้างหมดแล้ว — กด “ดูก่อนล้าง” เพื่อดูรายการล่าสุดได้");
+    }catch(error){
+      window.alert(error.message||"ล้างข้อมูลไม่สำเร็จ ลองใหม่อีกครั้ง");
+    }finally{
+      confirmButton.disabled=false;
+      confirmButton.textContent="ยืนยัน ล้างข้อมูล";
+    }
+  },true);
+  previewButton.addEventListener("click",async()=>{
+    try{
+      const orders=await readSnapshot();
+      if(!orders.length){showToast("ยังไม่มีข้อมูลก่อนล้าง");await updatePreviewButton();return}
+      title.textContent="ข้อมูลก่อนล้างล่าสุด (วันนี้)";
+      document.getElementById("resetModalSummary").innerHTML='<div style="max-height:50vh;overflow-y:auto;">'+previewHtml(orders)+'</div>';
+      confirmButton.style.display="none";
+      cancelButton.textContent="ปิด";
+      modal.style.display="flex";
+    }catch(error){showToast("โหลดข้อมูลก่อนล้างไม่สำเร็จ")}
+  });
+  updatePreviewButton();
+})();
+</script>`;
+
 function responsivePage(html){
   const inbox = `<section class="main-tab-panel active" data-mainpanel="inbox"><div class="supplier-page"><div class="supplier-headline"><div><h2>สั่งออเดอร์ซัพพลายเออร์</h2><p id="supplierSub">จัดกลุ่มวัตถุดิบตามซัพพลายเออร์</p></div><button class="btn-cta" id="composeToggleBtn">+ วางข้อความสั่งซื้อใหม่</button></div><div class="compose-box" id="composeBox" style="display:none;"><div class="row2"><input type="text" id="ordererInput" placeholder="ชื่อผู้สั่ง (ไม่บังคับ)"><select id="departmentSelect"><option value="">แผนก/ที่มา (ไม่บังคับ)</option><option value="ร้านโกปี๊ หลังโรงไม้">ร้านโกปี๊ หลังโรงไม้</option><option value="The Old Offset">The Old Offset</option><option value="__new__">+ อื่นๆ (พิมพ์เอง)</option></select><input type="text" id="departmentCustom" placeholder="พิมพ์ชื่อแผนก/ที่มา" style="display:none;"></div><textarea id="rawInput" placeholder="วางข้อความสั่งซื้อจาก LINE ที่นี่..."></textarea><div class="row"><button class="secondary" id="composeCancelBtn">ยกเลิก</button><button class="btn-cta" id="processBtn">บันทึกออเดอร์ (0 รายการ)</button></div></div><div class="supplier-workspace"><aside class="supplier-inbox"><div class="supplier-label"><span>วัตถุดิบที่ต้องตรวจสอบ</span><span class="supplier-column-count" id="pendingCountBadge">0</span></div><div class="supplier-stack" id="ordersList"></div></aside><main class="supplier-board-wrap"><div class="supplier-label"><span>จัดกลุ่มตามซัพพลายเออร์</span><span>ย้ายซัพ / แก้จำนวน</span></div><div class="supplier-board" id="supplierBoard"></div></main></div></div></section>`;
   const dispatch = `<section class="main-tab-panel" data-mainpanel="dispatch"><div class="dispatch-page"><div class="dispatch-head"><div><h2>สรุปออเดอร์แยกซัพพลายเออร์</h2><p>ตรวจสอบและส่งรายการที่จัดกลุ่มแล้ว</p></div><div class="row"><select id="historyDaySelect" style="display:none;"></select><button class="small secondary" id="viewYesterdayBtn" style="display:none;">🕐 ดูข้อมูลย้อนหลัง</button><button class="small secondary" id="dailyResetBtn">🗑️ ล้างหมด</button></div></div><div id="results"></div></div></section>`;
   const menu = `<section class="main-tab-panel" data-mainpanel="menu"><div class="material-page"><div class="material-head"><h2>จัดการวัตถุดิบ &amp; ราคา <span class="material-badge" id="dictCount">0</span></h2><p>ตั้งราคาต่อหน่วย หมวดหมู่ และคำเทียบเคียง</p></div><div class="material-toolbar"><input type="text" id="dictSearch" placeholder="ค้นหาวัตถุดิบ..."><button id="addItemToggleBtn">+ เพิ่มวัตถุดิบใหม่</button></div><div class="card"><div id="addItemForm" class="inline-form" style="display:none;"><input type="text" id="newItemName" placeholder="ชื่อวัตถุดิบ"><select id="newItemCategory"></select><select id="newItemSupplier"></select><input type="text" id="newSupplierCustom" placeholder="ซัพพลายเออร์ใหม่" style="display:none;"><input type="text" id="newItemPrice" placeholder="ราคา/หน่วย"><button class="small" id="addDictBtn">บันทึก</button></div><div id="dictSimilarWarning" style="display:none;"></div><input type="text" id="nameCheckInput" placeholder="ทดสอบการแมทคำ" style="width:100%;"><div id="nameCheckResult"></div><div id="menuGroups"></div></div></div></section>`;
-  return html.replace(/<section class="main-tab-panel active" data-mainpanel="inbox">[\s\S]*?<\/section>/,inbox).replace(/<section class="main-tab-panel" data-mainpanel="dispatch">[\s\S]*?<\/section>/,dispatch).replace(/<section class="main-tab-panel" data-mainpanel="menu">[\s\S]*?<\/section>/,menu).replace('</body>',RESPONSIVE_UI+'</body>');
+  return html.replace(/<section class="main-tab-panel active" data-mainpanel="inbox">[\s\S]*?<\/section>/,inbox).replace(/<section class="main-tab-panel" data-mainpanel="dispatch">[\s\S]*?<\/section>/,dispatch).replace(/<section class="main-tab-panel" data-mainpanel="menu">[\s\S]*?<\/section>/,menu).replace('</body>',RESPONSIVE_UI+RESET_SNAPSHOT_UI+'</body>');
 }
 
 // New: shared-password gate for the admin dashboard and its data APIs. Everything else
@@ -969,7 +1049,11 @@ export default {
       if (!dateParam || !/^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
         return new Response("Missing or invalid ?date=YYYY-MM-DD", { status: 400 });
       }
-      const key = ORDER_KEY_PREFIX + dateParam;
+      const snapshotParam = url.searchParams.get("snapshot");
+      if (snapshotParam && snapshotParam !== "reset") {
+        return new Response("Invalid snapshot type", { status: 400 });
+      }
+      const key = (snapshotParam === "reset" ? ORDER_RESET_SNAPSHOT_PREFIX : ORDER_KEY_PREFIX) + dateParam;
       await cleanupOldOrderKeys(env); // cutoff always from server clock now — see fix note above
       if (request.method === "GET") {
         const orders = (await env.KOPI_KV.get(key, { type: "json" })) || [];
