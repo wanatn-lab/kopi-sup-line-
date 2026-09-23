@@ -1112,45 +1112,91 @@ function responsivePage(html){
 //   /webhook/line      -> verified via LINE's HMAC signature (verifyLineSignature)
 //   /liff, /liff.html  -> static LIFF shell, opened inside LINE's in-app browser
 //   /api/pending-order -> verified via a LINE LIFF ID token (getVerifiedLiffOwnerId)
-// Basic Auth would break all three (LINE and the LIFF browser never send it), so only the
-// plain-browser dashboard surface is gated here.
+// A signed session cookie would break all three too (LINE and the LIFF browser never send
+// it), so only the plain-browser dashboard surface is gated here.
 const AUTH_PROTECTED_PATHS = new Set(["/", "/index.html", "/api/state", "/api/orders"]);
+const ADMIN_SESSION_TTL_SECONDS = 60 * 60 * 24 * 14;
 
-// Fails CLOSED on purpose: if ADMIN_PASSWORD hasn't been set yet (wrangler secret put
-// ADMIN_PASSWORD), every protected path returns 401 instead of silently staying open.
-// Username is not checked — this is one shared password for the whole shop, not per-user
-// accounts — only the password half of "Basic base64(user:pass)" has to match.
-function isAdminAuthorized(request, env) {
-  if (!env.ADMIN_PASSWORD) return false;
-  const header = request.headers.get("Authorization") || "";
-  if (!header.startsWith("Basic ")) return false;
-  let decoded;
-  try {
-    decoded = atob(header.slice(6));
-  } catch (e) {
-    return false;
-  }
-  const sepIndex = decoded.indexOf(":");
-  const password = sepIndex === -1 ? decoded : decoded.slice(sepIndex + 1);
-  return password === env.ADMIN_PASSWORD;
+function getCookie(request, name) {
+  const value = (request.headers.get("Cookie") || "").split(";").map((part) => part.trim())
+    .find((part) => part.startsWith(name + "="));
+  return value ? value.slice(name.length + 1) : "";
 }
 
-function adminAuthChallenge() {
-  // WWW-Authenticate makes the browser show its own native login popup — no custom
-  // login page/JS needed on the front end, and the browser caches the credential for
-  // every same-origin request after the first (fetch() calls in the page get it for free).
-  return new Response("Unauthorized", {
-    status: 401,
-    headers: { "WWW-Authenticate": 'Basic realm="Kopi Order Cloud", charset="UTF-8"' }
-  });
+function base64Url(bytes) {
+  let value = "";
+  new Uint8Array(bytes).forEach((byte) => { value += String.fromCharCode(byte); });
+  return btoa(value).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function sessionSignature(payload, password) {
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode("kopi-admin-session:" + password),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  return base64Url(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload)));
+}
+
+function constantTimeEqual(left, right) {
+  if (left.length !== right.length) return false;
+  let different = 0;
+  for (let index = 0; index < left.length; index += 1) different |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  return different === 0;
+}
+
+async function createAdminSession(env) {
+  const expiresAt = Math.floor(Date.now() / 1000) + ADMIN_SESSION_TTL_SECONDS;
+  const payload = "v1." + expiresAt;
+  return payload + "." + await sessionSignature(payload, env.ADMIN_PASSWORD);
+}
+
+async function isAdminAuthorized(request, env) {
+  if (!env.ADMIN_PASSWORD) return false;
+  const parts = getCookie(request, "kopi_admin_session").split(".");
+  if (parts.length !== 3 || parts[0] !== "v1" || !/^\d+$/.test(parts[1])) return false;
+  if (Number(parts[1]) <= Math.floor(Date.now() / 1000)) return false;
+  const payload = parts[0] + "." + parts[1];
+  return constantTimeEqual(parts[2], await sessionSignature(payload, env.ADMIN_PASSWORD));
+}
+
+function safeLoginNext(value) {
+  return AUTH_PROTECTED_PATHS.has(value) ? value : "/";
+}
+
+function adminLoginPage(next, error) {
+  const message = error ? '<p class="error">รหัสผ่านไม่ถูกต้อง กรุณาลองใหม่</p>' : "";
+  return new Response(`<!doctype html><html lang="th"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>เข้าสู่ระบบ</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f7f6f2;color:#22201c;font-family:'Segoe UI','Noto Sans Thai',Tahoma,sans-serif}.card{width:min(360px,calc(100% - 32px));background:#fff;border:1px solid #e7e3d8;border-radius:16px;padding:28px;box-shadow:0 8px 28px rgba(20,20,18,.08)}h1{font-size:20px;margin:0 0 6px}.sub{margin:0 0 20px;color:#767267;font-size:13px}label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}input{width:100%;box-sizing:border-box;border:1px solid #d8d3c4;border-radius:10px;padding:12px;font:inherit}button{width:100%;margin-top:14px;border:0;border-radius:10px;padding:12px;background:#0d7377;color:#fff;font:inherit;font-weight:700;cursor:pointer}.error{background:#fbeae8;border:1px solid #efc3be;border-radius:10px;color:#7e2b25;padding:10px 12px;font-size:13px}</style></head><body><main class="card"><h1>เข้าสู่ระบบ</h1><p class="sub">หน้าแยกออเดอร์สั่งของ</p>${message}<form method="post" action="/login"><input type="hidden" name="next" value="${next}"><label for="password">รหัสผ่าน</label><input id="password" name="password" type="password" autocomplete="current-password" required autofocus><button type="submit">เข้าสู่ระบบ</button></form></main></body></html>`, { headers: { "Content-Type": "text/html; charset=UTF-8", "Cache-Control": "no-store" }, status: error ? 401 : 200 });
+}
+
+function sessionCookie(token) {
+  return "kopi_admin_session=" + token + "; Max-Age=" + ADMIN_SESSION_TTL_SECONDS + "; Path=/; HttpOnly; Secure; SameSite=Lax";
+}
+
+function adminAuthRequired(request, url) {
+  if (url.pathname.startsWith("/api/")) return Response.json({ error: "Authentication required" }, { status: 401 });
+  const next = safeLoginNext(url.pathname);
+  return Response.redirect(new URL("/login?next=" + encodeURIComponent(next), request.url), 302);
 }
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    if (AUTH_PROTECTED_PATHS.has(url.pathname) && !isAdminAuthorized(request, env)) {
-      return adminAuthChallenge();
+    if (url.pathname === "/login") {
+      const next = safeLoginNext(url.searchParams.get("next") || "/");
+      if (request.method === "GET") return adminLoginPage(next, false);
+      if (request.method === "POST") {
+        const form = await request.formData();
+        const submittedPassword = String(form.get("password") || "");
+        const formNext = safeLoginNext(String(form.get("next") || "/"));
+        if (!env.ADMIN_PASSWORD || !constantTimeEqual(submittedPassword, env.ADMIN_PASSWORD)) return adminLoginPage(formNext, true);
+        return new Response(null, { status: 302, headers: { "Location": formNext, "Set-Cookie": sessionCookie(await createAdminSession(env)), "Cache-Control": "no-store" } });
+      }
+      return new Response("Method not allowed", { status: 405 });
+    }
+
+    if (AUTH_PROTECTED_PATHS.has(url.pathname) && !(await isAdminAuthorized(request, env))) {
+      return adminAuthRequired(request, url);
     }
 
     if (url.pathname === "/api/state") {
