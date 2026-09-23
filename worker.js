@@ -846,9 +846,55 @@ function responsivePage(html){
   return html.replace(/<section class="main-tab-panel active" data-mainpanel="inbox">[\s\S]*?<\/section>/,inbox).replace(/<section class="main-tab-panel" data-mainpanel="dispatch">[\s\S]*?<\/section>/,dispatch).replace(/<section class="main-tab-panel" data-mainpanel="menu">[\s\S]*?<\/section>/,menu).replace('</body>',RESPONSIVE_UI+'</body>');
 }
 
+// New: shared-password gate for the admin dashboard and its data APIs. Everything else
+// in this file used to be reachable by anyone who had the Worker URL (see the file's own
+// setup notes at the top). This does NOT touch KV, the order/dict data model, or any
+// parsing/matching logic — it only decides whether a request is allowed to reach them.
+//
+// Deliberately excluded from this gate (each already has its own, more appropriate auth):
+//   /webhook/line      -> verified via LINE's HMAC signature (verifyLineSignature)
+//   /liff, /liff.html  -> static LIFF shell, opened inside LINE's in-app browser
+//   /api/pending-order -> verified via a LINE LIFF ID token (getVerifiedLiffOwnerId)
+// Basic Auth would break all three (LINE and the LIFF browser never send it), so only the
+// plain-browser dashboard surface is gated here.
+const AUTH_PROTECTED_PATHS = new Set(["/", "/index.html", "/api/state", "/api/orders"]);
+
+// Fails CLOSED on purpose: if ADMIN_PASSWORD hasn't been set yet (wrangler secret put
+// ADMIN_PASSWORD), every protected path returns 401 instead of silently staying open.
+// Username is not checked — this is one shared password for the whole shop, not per-user
+// accounts — only the password half of "Basic base64(user:pass)" has to match.
+function isAdminAuthorized(request, env) {
+  if (!env.ADMIN_PASSWORD) return false;
+  const header = request.headers.get("Authorization") || "";
+  if (!header.startsWith("Basic ")) return false;
+  let decoded;
+  try {
+    decoded = atob(header.slice(6));
+  } catch (e) {
+    return false;
+  }
+  const sepIndex = decoded.indexOf(":");
+  const password = sepIndex === -1 ? decoded : decoded.slice(sepIndex + 1);
+  return password === env.ADMIN_PASSWORD;
+}
+
+function adminAuthChallenge() {
+  // WWW-Authenticate makes the browser show its own native login popup — no custom
+  // login page/JS needed on the front end, and the browser caches the credential for
+  // every same-origin request after the first (fetch() calls in the page get it for free).
+  return new Response("Unauthorized", {
+    status: 401,
+    headers: { "WWW-Authenticate": 'Basic realm="Kopi Order Cloud", charset="UTF-8"' }
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    if (AUTH_PROTECTED_PATHS.has(url.pathname) && !isAdminAuthorized(request, env)) {
+      return adminAuthChallenge();
+    }
 
     if (url.pathname === "/api/state") {
       if (request.method === "GET") {
