@@ -81,7 +81,8 @@ function lnFindSupplierMatches(dict, aliasTable, rawName){
     const aliasNorm = lnNormalize(aliasCanonical);
     const target = (dict||[]).find(entry => lnNormalize(entry.name) === aliasNorm);
     if (target) return [{ supplier: target.supplier, canonicalName: target.name }];
-    return [{ supplier: null, canonicalName: aliasCanonical, missingSupplier: true }];
+    // Do not let an alias for a renamed/removed item stop the remaining match passes.
+    // The raw staff text can still identify a real item through containment below.
   }
 
   let candidates = [], bestLen = 0;
@@ -1096,11 +1097,32 @@ const MATCH_WORDS_PROTOTYPE_UI = String.raw`<style>
 })();
 </script>`;
 
+// Keep the dashboard tester and browser-side order parser aligned with the Worker.
+// A stale alias is ignored for this pass, allowing the live dictionary's containment
+// matching to recover a supplier from the original phrase.
+const MATCHING_FALLBACK_UI = String.raw`<script>
+window.findSupplierMatches=function(rawName){
+  const norm=normalize(rawName);
+  const exact=DICT.find(entry=>normalize(entry.name)===norm);
+  if(exact)return[{supplier:exact.supplier,canonicalName:exact.name,viaAlias:false}];
+  if(/\s/.test((rawName||"").trim())){
+    const firstNorm=normalize(firstToken(rawName));
+    if(firstNorm&&firstNorm!==norm){const first=DICT.find(entry=>normalize(entry.name)===firstNorm);if(first)return[{supplier:first.supplier,canonicalName:first.name,viaAlias:false,viaFirstWord:true}]}
+  }
+  const aliasCanonical=resolveCanonicalViaAlias(rawName);
+  if(aliasCanonical){const target=DICT.find(entry=>normalize(entry.name)===normalize(aliasCanonical));if(target)return[{supplier:target.supplier,canonicalName:target.name,viaAlias:true}]}
+  let candidates=[],bestLen=0;
+  DICT.forEach(entry=>{const entryNorm=normalize(entry.name);const hit=(norm.length>=3&&entryNorm.includes(norm))||(entryNorm.length>=3&&norm.includes(entryNorm));if(!hit)return;const length=entryNorm.length;if(length>bestLen){candidates=[entry];bestLen=length}else if(length===bestLen)candidates.push(entry)});
+  const bySupplier={};candidates.forEach(candidate=>{bySupplier[candidate.supplier]=candidate.name});
+  return Object.keys(bySupplier).map(supplier=>({supplier,canonicalName:bySupplier[supplier],viaContainment:true}));
+};
+</script>`;
+
 function responsivePage(html){
   const inbox = `<section class="main-tab-panel active" data-mainpanel="inbox"><div class="supplier-page"><div class="supplier-headline"><div><h2>สั่งออเดอร์ซัพพลายเออร์</h2><p id="supplierSub">จัดกลุ่มวัตถุดิบตามซัพพลายเออร์</p></div><button class="btn-cta" id="composeToggleBtn">+ วางข้อความสั่งซื้อใหม่</button></div><div class="compose-box" id="composeBox" style="display:none;"><div class="row2"><input type="text" id="ordererInput" placeholder="ชื่อผู้สั่ง (ไม่บังคับ)"><select id="departmentSelect"><option value="">แผนก/ที่มา (ไม่บังคับ)</option><option value="ร้านโกปี๊ หลังโรงไม้">ร้านโกปี๊ หลังโรงไม้</option><option value="The Old Offset">The Old Offset</option><option value="__new__">+ อื่นๆ (พิมพ์เอง)</option></select><input type="text" id="departmentCustom" placeholder="พิมพ์ชื่อแผนก/ที่มา" style="display:none;"></div><textarea id="rawInput" placeholder="วางข้อความสั่งซื้อจาก LINE ที่นี่..."></textarea><div class="row"><button class="secondary" id="composeCancelBtn">ยกเลิก</button><button class="btn-cta" id="processBtn">บันทึกออเดอร์ (0 รายการ)</button></div></div><div class="supplier-workspace"><aside class="supplier-inbox"><div class="supplier-label"><span>วัตถุดิบที่ต้องตรวจสอบ</span><span class="supplier-column-count" id="pendingCountBadge">0</span></div><div class="supplier-stack" id="ordersList"></div></aside><main class="supplier-board-wrap"><div class="supplier-label"><span>จัดกลุ่มตามซัพพลายเออร์</span><span>ย้ายซัพ / แก้จำนวน</span></div><div class="supplier-board" id="supplierBoard"></div></main></div></div></section>`;
   const dispatch = `<section class="main-tab-panel" data-mainpanel="dispatch"><div class="dispatch-page"><div class="dispatch-head"><div><h2>สรุปออเดอร์แยกซัพพลายเออร์</h2><p>ตรวจสอบและส่งรายการที่จัดกลุ่มแล้ว</p></div><div class="row"><select id="historyDaySelect" style="display:none;"></select><button class="small secondary" id="viewYesterdayBtn" style="display:none;">🕐 ดูข้อมูลย้อนหลัง</button><button class="small secondary" id="dailyResetBtn">🗑️ ล้างหมด</button></div></div><div id="results"></div></div></section>`;
   const menu = `<section class="main-tab-panel" data-mainpanel="menu"><div class="material-page match-words-page"><div class="material-head"><h2>วัตถุดิบ/แมทคำ <span class="material-badge" id="dictCount">0</span></h2><p>ค้นหา ทดสอบคำแมท และจัดการรายการวัตถุดิบในหน้าเดียว</p></div><button class="btn-cta" id="addItemToggleBtn">＋ เพิ่มวัตถุดิบใหม่</button><div id="addItemForm" class="match-add-form"><h3 style="margin:0 0 12px;">เพิ่มวัตถุดิบใหม่</h3><div class="grid"><div><label class="field-label">ชื่อวัตถุดิบ *</label><input type="text" id="newItemName" placeholder="เช่น เนื้อหมูสับ"></div><div><label class="field-label">ราคา/หน่วย</label><input type="text" id="newItemPrice" placeholder="ไม่บังคับ"></div><div><label class="field-label">ซัพพลายเออร์ *</label><select id="newItemSupplier"></select><input type="text" id="newSupplierCustom" placeholder="พิมพ์ชื่อซัพพลายเออร์ใหม่" style="display:none;margin-top:6px;"></div><div><label class="field-label">หมวด</label><select id="newItemCategory"></select></div></div><div id="dictSimilarWarning" style="display:none;"></div><div class="row"><button class="small secondary" id="addItemCancelBtn" type="button">ยกเลิก</button><button class="small" id="addDictBtn" type="button">บันทึก</button></div></div><div class="match-search"><div class="match-search-box"><span class="match-search-icon">🔍</span><input type="text" id="dictSearch" placeholder="พิมพ์ชื่อวัตถุดิบ / คำที่พนักงานส่งมา" autocomplete="off"></div><div id="matchTestResult"></div></div><input type="text" id="nameCheckInput" style="display:none;"><div id="nameCheckResult" style="display:none;"></div><div class="match-stats"><div class="match-stat"><b id="matchStatItems">0</b><span>วัตถุดิบ</span></div><div class="match-stat"><b id="matchStatAlias">0</b><span>คำแมท</span></div><div class="match-stat alert"><b id="matchStatNoPrice">0</b><span>ยังไม่ใส่ราคา</span></div></div><div class="match-toolbar"><span class="match-toolbar-title">รายการวัตถุดิบ</span><div class="match-segment" id="matchGroupMode"><button type="button" data-mode="supplier" class="on">ตามซัพพลายเออร์</button><button type="button" data-mode="category">ตามหมวด</button></div></div><div class="match-filters" id="matchFilters"></div><div id="menuGroups"></div></div></section>`;
-  return html.replace(/<section class="main-tab-panel active" data-mainpanel="inbox">[\s\S]*?<\/section>/,inbox).replace(/<section class="main-tab-panel" data-mainpanel="dispatch">[\s\S]*?<\/section>/,dispatch).replace(/<section class="main-tab-panel" data-mainpanel="menu">[\s\S]*?<\/section>/,menu).replace('</body>',RESPONSIVE_UI+RESET_SNAPSHOT_UI+MATCH_WORDS_UI+MATCH_WORDS_PROTOTYPE_UI+'</body>');
+  return html.replace(/<section class="main-tab-panel active" data-mainpanel="inbox">[\s\S]*?<\/section>/,inbox).replace(/<section class="main-tab-panel" data-mainpanel="dispatch">[\s\S]*?<\/section>/,dispatch).replace(/<section class="main-tab-panel" data-mainpanel="menu">[\s\S]*?<\/section>/,menu).replace('</body>',RESPONSIVE_UI+RESET_SNAPSHOT_UI+MATCH_WORDS_UI+MATCH_WORDS_PROTOTYPE_UI+MATCHING_FALLBACK_UI+'</body>');
 }
 
 // New: shared-password gate for the admin dashboard and its data APIs. Everything else
