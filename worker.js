@@ -298,8 +298,21 @@ async function getActiveAdminId(env){
 // New: deletes any kopi_orders_YYYY-MM-DD KV key older than ORDER_RETENTION_DAYS days.
 // Called on every /api/orders request below (GET or POST) instead of a separate cron
 // trigger, since date strings sort lexically so no Date parsing of the key list is needed.
-async function cleanupOldOrderKeys(env, todayStr){
+// SECURITY FIX (2026-09-23): this used to take the caller-supplied ?date= value as
+// "today" for the cutoff calculation. Since /api/orders has no auth, anyone with the
+// URL could send GET /api/orders?date=2099-12-31 and the cutoff would land far in the
+// future, matching every real order key and deleting ALL order history in one request.
+// The date used for the retention cutoff must never come from the request — it is now
+// always derived from the Worker's own clock (Thailand has no DST, so a fixed UTC+7
+// offset is safe here). dateParam is still used elsewhere only to pick which day's key
+// to read/write, never to decide what counts as "old".
+function serverTodayStrBangkok(){
+  const bangkokMs = Date.now() + 7 * 60 * 60 * 1000; // UTC+7
+  return new Date(bangkokMs).toISOString().slice(0, 10);
+}
+async function cleanupOldOrderKeys(env){
   if (!env.KOPI_KV) return;
+  const todayStr = serverTodayStrBangkok();
   const cutoff = new Date(todayStr + "T00:00:00Z");
   cutoff.setUTCDate(cutoff.getUTCDate() - ORDER_RETENTION_DAYS);
   const cutoffStr = cutoff.toISOString().slice(0, 10);
@@ -866,7 +879,7 @@ export default {
         return new Response("Missing or invalid ?date=YYYY-MM-DD", { status: 400 });
       }
       const key = ORDER_KEY_PREFIX + dateParam;
-      await cleanupOldOrderKeys(env, dateParam);
+      await cleanupOldOrderKeys(env); // cutoff always from server clock now — see fix note above
       if (request.method === "GET") {
         const orders = (await env.KOPI_KV.get(key, { type: "json" })) || [];
         return Response.json(orders);
