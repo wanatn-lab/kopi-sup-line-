@@ -847,7 +847,7 @@ const RESPONSIVE_UI = String.raw`<style>
   const suppliers=()=>allSuppliers().filter(Boolean);
   function card(r){
     const k=r.o.id+'|'+r.i.id,open=picker===k;
-    return '<article class="supplier-card"><div class="supplier-card-top"><div><div class="supplier-card-name">'+esc(r.i.label)+'</div><div class="supplier-card-meta">'+esc(r.o.department||r.o.orderer||'ออเดอร์')+'</div></div><div class="supplier-card-meta">'+esc(r.i.qty||'?')+' '+esc(r.i.unit||'')+'</div></div><div class="supplier-card-actions"><button data-ui="move" data-o="'+esc(r.o.id)+'" data-i="'+esc(r.i.id)+'">ย้ายซัพ</button><button data-ui="qty" data-o="'+esc(r.o.id)+'" data-i="'+esc(r.i.id)+'">แก้จำนวน</button><button data-ui="label" data-o="'+esc(r.o.id)+'" data-i="'+esc(r.i.id)+'">แก้ชื่อ</button><button data-ui="remove" data-o="'+esc(r.o.id)+'" data-i="'+esc(r.i.id)+'">ยกเลิกรายการ</button></div>'+(open?'<select data-ui-supplier data-o="'+esc(r.o.id)+'" data-i="'+esc(r.i.id)+'"><option value="">เลือกซัพพลายเออร์</option>'+suppliers().map(s=>'<option value="'+esc(s)+'"'+(s===r.i.supplier?' selected':'')+'>'+esc(s)+'</option>').join('')+'</select>':'')+'</article>';
+    return '<article class="supplier-card"><div class="supplier-card-top"><div><div class="supplier-card-name">'+esc(r.i.label)+'</div><div class="supplier-card-meta">'+esc(r.o.department||r.o.orderer||'ออเดอร์')+'</div></div><div class="supplier-card-meta">'+esc(r.i.qty||'?')+' '+esc(r.i.unit||'')+'</div></div><div class="supplier-card-actions"><button data-ui="move" data-o="'+esc(r.o.id)+'" data-i="'+esc(r.i.id)+'">ย้ายซัพ</button><button data-ui="qty" data-o="'+esc(r.o.id)+'" data-i="'+esc(r.i.id)+'">แก้จำนวน</button><button data-ui="label" data-o="'+esc(r.o.id)+'" data-i="'+esc(r.i.id)+'">แก้ชื่อ</button><button data-ui="remove" data-o="'+esc(r.o.id)+'" data-i="'+esc(r.i.id)+'">ยกเลิกรายการ</button></div>'+(open?'<select data-ui-supplier data-o="'+esc(r.o.id)+'" data-i="'+esc(r.i.id)+'"><option value="">เลือกซัพพลายเออร์</option>'+suppliers().map(s=>'<option value="'+esc(s)+'"'+(s===r.i.supplier?' selected':'')+'>'+esc(s)+'</option>').join('')+'</select>':'')+(r.i._pendingSimilar?'<div style="margin-top:8px;padding:8px 10px;background:#FFF4D6;border:1px solid #E6C766;border-radius:8px;font-size:13px;">พบชื่อคล้าย "'+esc(r.i._pendingSimilar.similarName)+'" ('+esc(r.i._pendingSimilar.similarSupplier)+') ในระบบแล้ว — ใช่รายการเดียวกันไหม?<div class="supplier-card-actions" style="margin-top:6px;"><button data-ui="simYes" data-o="'+esc(r.o.id)+'" data-i="'+esc(r.i.id)+'">ใช่ ใช้ชื่อเดิม</button><button data-ui="simNew" data-o="'+esc(r.o.id)+'" data-i="'+esc(r.i.id)+'">ไม่ใช่ เป็นรายการใหม่</button></div></div>':'')+'</article>';
   }
   function renderSupplierUI(){
     const all=rows(),un=all.filter(r=>!r.i.supplier),assigned=all.filter(r=>r.i.supplier),list=document.querySelector('#ordersList'),board=document.querySelector('#supplierBoard');
@@ -866,6 +866,8 @@ const RESPONSIVE_UI = String.raw`<style>
     const b=e.target.closest('[data-ui]');if(!b)return;
     const o=b.dataset.o,i=b.dataset.i;
     if(b.dataset.ui==='move'){picker=picker===o+'|'+i?null:o+'|'+i;renderOrders()}
+    if(b.dataset.ui==='simYes')resolveSimilarAsExisting(o,i);
+    if(b.dataset.ui==='simNew')resolveSimilarAsNew(o,i);
     if(b.dataset.ui==='qty'){
       const r=rows().find(x=>x.o.id===o&&x.i.id===i),v=r&&prompt('จำนวนใหม่สำหรับ '+r.i.label,r.i.qty||'');
       if(v!==null&&r){editItemQty(o,i,v,r.i.unit);renderOrders();renderDispatch()}
